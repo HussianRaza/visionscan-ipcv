@@ -6,3 +6,4 @@ numpy
 pytesseract
 Pillow
 fpdf2
+pypdf

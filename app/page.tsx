@@ -2,8 +2,8 @@
 
 import React, { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { 
-  DndContext, 
+import {
+  DndContext,
   closestCenter,
   KeyboardSensor,
   PointerSensor,
@@ -26,7 +26,7 @@ import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { UploadCloud, Wand2, FileText, Download, Settings, Loader2, ImagePlus } from 'lucide-react';
+import { UploadCloud, Wand2, FileText, Download, Settings, Loader2, ImagePlus, Copy } from 'lucide-react';
 import { toast, Toaster } from 'sonner';
 
 import { ThemeToggle } from '@/components/theme-toggle';
@@ -69,6 +69,9 @@ export default function Home() {
   const [options, setOptions] = useState<ProcessingOptions>(DEFAULT_OPTIONS);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [processProgress, setProcessProgress] = useState<{ current: number; total: number } | null>(null);
+  const [ocrProgress, setOcrProgress] = useState<{ current: number; total: number } | null>(null);
+  const [searchablePdf, setSearchablePdf] = useState(false);
   const [apiUrl, setApiUrl] = useState(
     process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
   );
@@ -81,7 +84,6 @@ export default function Home() {
   );
 
   useEffect(() => {
-    // Cleanup object URLs to avoid memory leaks
     return () => {
       images.forEach(img => {
         URL.revokeObjectURL(img.originalUrl);
@@ -93,21 +95,15 @@ export default function Home() {
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const newImages = acceptedFiles.map(file => ({
-      id: Math.random().toString(36).substring(7),
+      id: crypto.randomUUID(),
       file,
       originalUrl: URL.createObjectURL(file),
     }));
-    
-    setImages(prev => {
-      const updated = [...prev, ...newImages];
-      if (!activeId && updated.length > 0) {
-        setActiveId(updated[0].id);
-      }
-      return updated;
-    });
-  }, [activeId]);
+    setImages(prev => [...prev, ...newImages]);
+    setActiveId(prev => prev ?? (newImages.length > 0 ? newImages[0].id : null));
+  }, []);
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({ 
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
       'image/*': ['.jpeg', '.jpg', '.png', '.webp']
@@ -155,16 +151,14 @@ export default function Home() {
         body: formData,
       });
 
-      if (!response.ok) {
-        throw new Error('Processing failed');
-      }
+      if (!response.ok) throw new Error('Processing failed');
 
       const blob = await response.blob();
       const processedUrl = URL.createObjectURL(blob);
 
-      setImages(prev => prev.map(img => 
-        img.id === activeId 
-          ? { ...img, processedUrl } 
+      setImages(prev => prev.map(img =>
+        img.id === activeId
+          ? { ...img, processedUrl }
           : img
       ));
       toast.success('Image processed successfully!');
@@ -176,9 +170,39 @@ export default function Home() {
     }
   };
 
+  const handleProcessAll = async () => {
+    if (images.length === 0) return;
+    const snapshot = [...images];
+    setProcessProgress({ current: 0, total: snapshot.length });
+
+    for (let i = 0; i < snapshot.length; i++) {
+      setProcessProgress({ current: i + 1, total: snapshot.length });
+      const img = snapshot[i];
+      try {
+        const formData = new FormData();
+        formData.append('file', img.file);
+        formData.append('options', JSON.stringify(options));
+
+        const response = await fetch(`${apiUrl}/process`, { method: 'POST', body: formData });
+        if (!response.ok) throw new Error('Processing failed');
+
+        const blob = await response.blob();
+        const processedUrl = URL.createObjectURL(blob);
+        setImages(prev => prev.map(item =>
+          item.id === img.id ? { ...item, processedUrl } : item
+        ));
+      } catch {
+        toast.error(`Failed to process page ${i + 1}.`);
+      }
+    }
+
+    setProcessProgress(null);
+    toast.success('All images processed!');
+  };
+
   const handleOCR = async () => {
     if (!activeImage) return;
-    const fileToProcess = activeImage.processedUrl 
+    const fileToProcess = activeImage.processedUrl
       ? await fetch(activeImage.processedUrl).then(r => r.blob())
       : activeImage.file;
 
@@ -195,9 +219,9 @@ export default function Home() {
       if (!response.ok) throw new Error('OCR failed');
 
       const data = await response.json();
-      setImages(prev => prev.map(img => 
-        img.id === activeId 
-          ? { ...img, extractedText: data.text } 
+      setImages(prev => prev.map(img =>
+        img.id === activeId
+          ? { ...img, extractedText: data.text }
           : img
       ));
       toast.success('Text extracted successfully!');
@@ -207,17 +231,84 @@ export default function Home() {
     }
   };
 
+  const handleOCRAll = async () => {
+    const toProcess = images.filter(img => !img.extractedText);
+    if (toProcess.length === 0) {
+      toast.info('All images already have extracted text.');
+      return;
+    }
+    setOcrProgress({ current: 0, total: toProcess.length });
+
+    for (let i = 0; i < toProcess.length; i++) {
+      setOcrProgress({ current: i + 1, total: toProcess.length });
+      const img = toProcess[i];
+      const fileToProcess = img.processedUrl
+        ? await fetch(img.processedUrl).then(r => r.blob())
+        : img.file;
+      try {
+        const formData = new FormData();
+        formData.append('file', fileToProcess as Blob, img.file.name);
+        const response = await fetch(`${apiUrl}/ocr`, { method: 'POST', body: formData });
+        if (!response.ok) throw new Error('OCR failed');
+        const data = await response.json();
+        setImages(prev => prev.map(item =>
+          item.id === img.id ? { ...item, extractedText: data.text } : item
+        ));
+      } catch {
+        // continue with remaining images
+      }
+    }
+
+    setOcrProgress(null);
+    toast.success('OCR complete on all images!');
+  };
+
+  const handleCopyAllText = () => {
+    const allText = images
+      .filter(img => img.extractedText)
+      .map((img, i) => `--- Page ${i + 1} ---\n${img.extractedText}`)
+      .join('\n\n');
+    if (!allText) {
+      toast.error('No extracted text to copy.');
+      return;
+    }
+    navigator.clipboard.writeText(allText);
+    toast.success('All text copied to clipboard!');
+  };
+
+  const handleDownloadText = () => {
+    const allText = images
+      .filter(img => img.extractedText)
+      .map((img, i) => `--- Page ${i + 1} ---\n${img.extractedText}`)
+      .join('\n\n');
+    if (!allText) {
+      toast.error('No extracted text to download.');
+      return;
+    }
+    const blob = new Blob([allText], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `document_text_${Date.now()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast.success('Text file downloaded!');
+  };
+
   const handleExportPDF = async () => {
     if (images.length === 0) return;
     setIsExporting(true);
     try {
       const formData = new FormData();
       for (const img of images) {
-        const fileToUse = img.processedUrl 
+        const fileToUse = img.processedUrl
           ? await fetch(img.processedUrl).then(r => r.blob())
           : img.file;
         formData.append('files', fileToUse, img.file.name);
       }
+      formData.append('searchable', searchablePdf ? 'true' : 'false');
 
       const response = await fetch(`${apiUrl}/export-pdf`, {
         method: 'POST',
@@ -244,6 +335,10 @@ export default function Home() {
     }
   };
 
+  const hasAnyText = images.some(img => img.extractedText);
+  const isBatchProcessing = processProgress !== null;
+  const isBatchOCR = ocrProgress !== null;
+
   return (
     <div className="min-h-screen bg-background text-foreground font-sans">
       <header className="bg-background border-b border-border px-6 py-4 flex items-center justify-between sticky top-0 z-10">
@@ -253,7 +348,7 @@ export default function Home() {
           </div>
           IPCV DocuScan
         </div>
-        
+
         <div className="flex items-center gap-2">
           <ThemeToggle />
           <Dialog>
@@ -267,10 +362,10 @@ export default function Home() {
               <div className="py-4 space-y-4">
                 <div className="space-y-2">
                   <Label htmlFor="apiUrl">FastAPI Backend URL</Label>
-                  <Input 
-                    id="apiUrl" 
-                    value={apiUrl} 
-                    onChange={e => setApiUrl(e.target.value)} 
+                  <Input
+                    id="apiUrl"
+                    value={apiUrl}
+                    onChange={e => setApiUrl(e.target.value)}
                     placeholder="https://your-space.hf.space"
                   />
                   <p className="text-xs text-muted-foreground">
@@ -310,8 +405,8 @@ export default function Home() {
                       <Label htmlFor={opt.id} className="cursor-pointer">{opt.label}</Label>
                       <p className="text-[10px] text-muted-foreground">{opt.desc}</p>
                     </div>
-                    <Switch 
-                      id={opt.id} 
+                    <Switch
+                      id={opt.id}
                       checked={options[opt.id as keyof ProcessingOptions] as boolean}
                       onCheckedChange={(c) => setOptions(prev => ({...prev, [opt.id]: c}))}
                     />
@@ -321,14 +416,14 @@ export default function Home() {
                 <div className="pt-4 border-t border-border">
                   <div className="flex items-center justify-between mb-2">
                     <Label htmlFor="watermark" className="cursor-pointer">Watermark</Label>
-                    <Switch 
-                      id="watermark" 
+                    <Switch
+                      id="watermark"
                       checked={options.watermark}
                       onCheckedChange={(c) => setOptions(prev => ({...prev, watermark: c}))}
                     />
                   </div>
                   {options.watermark && (
-                    <Input 
+                    <Input
                       value={options.watermark_text}
                       onChange={(e) => setOptions(prev => ({...prev, watermark_text: e.target.value}))}
                       className="h-8 text-sm mt-2"
@@ -338,14 +433,31 @@ export default function Home() {
                 </div>
               </div>
 
-              <Button 
-                className="w-full mt-4" 
-                onClick={handleProcess}
-                disabled={!activeImage || isProcessing}
-              >
-                {isProcessing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
-                Apply to Selected
-              </Button>
+              <div className="space-y-2 pt-2">
+                <Button
+                  className="w-full"
+                  onClick={handleProcess}
+                  disabled={!activeImage || isProcessing || isBatchProcessing}
+                >
+                  {isProcessing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                  Apply to Selected
+                </Button>
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  onClick={handleProcessAll}
+                  disabled={images.length === 0 || isProcessing || isBatchProcessing}
+                >
+                  {isBatchProcessing ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Processing {processProgress?.current} / {processProgress?.total}
+                    </>
+                  ) : (
+                    'Process All Pages'
+                  )}
+                </Button>
+              </div>
             </CardContent>
           </Card>
 
@@ -356,15 +468,42 @@ export default function Home() {
                 Text Extraction
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <Button 
-                variant="outline" 
+            <CardContent className="space-y-2">
+              <Button
+                variant="outline"
                 className="w-full"
                 onClick={handleOCR}
-                disabled={!activeImage}
+                disabled={!activeImage || isBatchOCR}
               >
-                Run Tesseract OCR
+                Run OCR on Selected
               </Button>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={handleOCRAll}
+                disabled={images.length === 0 || isBatchOCR}
+              >
+                {isBatchOCR ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    OCR {ocrProgress?.current} / {ocrProgress?.total}
+                  </>
+                ) : (
+                  'Run OCR on All Pages'
+                )}
+              </Button>
+              {hasAnyText && (
+                <div className="flex gap-2 pt-2 border-t border-border">
+                  <Button variant="ghost" size="sm" className="flex-1" onClick={handleCopyAllText}>
+                    <Copy className="w-3 h-3 mr-1" />
+                    Copy All
+                  </Button>
+                  <Button variant="ghost" size="sm" className="flex-1" onClick={handleDownloadText}>
+                    <Download className="w-3 h-3 mr-1" />
+                    Save .txt
+                  </Button>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -389,9 +528,9 @@ export default function Home() {
                 {activeImage ? (
                   <div className="relative aspect-[3/4] w-full flex items-center justify-center p-4">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img 
-                      src={activeImage.processedUrl || activeImage.originalUrl} 
-                      alt="Preview" 
+                    <img
+                      src={activeImage.processedUrl || activeImage.originalUrl}
+                      alt="Preview"
                       className="max-w-full max-h-[70vh] object-contain drop-shadow-sm transition-opacity"
                       style={{ opacity: isProcessing ? 0.5 : 1 }}
                     />
@@ -434,8 +573,8 @@ export default function Home() {
               <CardDescription>Drag to reorder</CardDescription>
             </CardHeader>
             <CardContent className="flex-1 overflow-hidden p-0 px-6 pb-6 flex flex-col gap-4">
-              <div 
-                {...getRootProps()} 
+              <div
+                {...getRootProps()}
                 className={`shrink-0 border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
                   isDragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50 hover:bg-muted'
                 }`}
@@ -446,18 +585,18 @@ export default function Home() {
               </div>
 
               <ScrollArea className="flex-1 -mx-2 px-2">
-                <DndContext 
+                <DndContext
                   sensors={sensors}
                   collisionDetection={closestCenter}
                   onDragEnd={handleDragEnd}
                 >
-                  <SortableContext 
+                  <SortableContext
                     items={images.map(i => i.id)}
                     strategy={rectSortingStrategy}
                   >
                     <div className="grid grid-cols-2 gap-3 pb-4">
                       {images.map((img) => (
-                        <SortableImage 
+                        <SortableImage
                           key={img.id}
                           id={img.id}
                           url={img.processedUrl || img.originalUrl}
@@ -471,17 +610,30 @@ export default function Home() {
                 </DndContext>
               </ScrollArea>
             </CardContent>
-            
-            <div className="p-4 border-t border-border bg-muted/50 shrink-0 rounded-b-lg">
-              <Button 
-                className="w-full" 
-                size="lg"
-                onClick={handleExportPDF}
-                disabled={images.length === 0 || isExporting}
-              >
-                {isExporting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Download className="w-4 h-4 mr-2" />}
-                Export PDF
-              </Button>
+
+            <div className="shrink-0 border-t border-border rounded-b-lg overflow-hidden">
+              <div className="px-4 py-3 bg-muted/30 flex items-center justify-between">
+                <div>
+                  <Label htmlFor="searchable-pdf" className="text-xs cursor-pointer">Searchable PDF</Label>
+                  <p className="text-[10px] text-muted-foreground">Embed selectable text layer</p>
+                </div>
+                <Switch
+                  id="searchable-pdf"
+                  checked={searchablePdf}
+                  onCheckedChange={setSearchablePdf}
+                />
+              </div>
+              <div className="p-4 bg-muted/50">
+                <Button
+                  className="w-full"
+                  size="lg"
+                  onClick={handleExportPDF}
+                  disabled={images.length === 0 || isExporting}
+                >
+                  {isExporting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Download className="w-4 h-4 mr-2" />}
+                  Export PDF
+                </Button>
+              </div>
             </div>
           </Card>
         </div>

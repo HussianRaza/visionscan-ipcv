@@ -53,15 +53,19 @@ async def process_ocr(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-pdf")
-async def export_pdf(files: List[UploadFile] = File(...)):
+async def export_pdf(
+    files: List[UploadFile] = File(...),
+    searchable: str = Form(default="false"),
+):
     try:
         images_bytes = []
         for file in files:
             img_bytes = await file.read()
             images_bytes.append(img_bytes)
-            
-        pdf_bytes = create_pdf(images_bytes)
-        
+
+        use_searchable = searchable.lower() == "true"
+        pdf_bytes = create_pdf(images_bytes, searchable=use_searchable)
+
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
