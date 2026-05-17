@@ -127,85 +127,159 @@ def auto_scan(img_bytes, mode='color'):
 
     return _encode_image(img)
 
-def apply_deskew(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bitwise_not(gray)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    
-    coords = np.column_stack(np.where(thresh > 0))
-    angle = cv2.minAreaRect(coords)[-1]
-    
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
-        
-    # If angle is too small or too large, don't deskew
-    if abs(angle) < 0.5 or abs(angle) > 20: 
-        return img
-        
-    (h, w) = img.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    return rotated
+def _auto_canny(gray, sigma=0.33):
+    """Adaptive Canny thresholds based on median pixel intensity."""
+    v = np.median(gray)
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    return cv2.Canny(gray, lower, upper)
 
-def apply_document_crop(img):
-    orig = img.copy()
-    ratio = img.shape[0] / 500.0
-    
-    # Resize down to fast processing
-    h, w = img.shape[:2]
-    resized = cv2.resize(img, (int(w/ratio), 500))
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    edged = cv2.Canny(blurred, 75, 200)
-    
-    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-    
-    screenCnt = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        
-        if len(approx) == 4:
-            screenCnt = approx
-            break
-            
-    if screenCnt is None:
-        return orig # No document found
-        
-    # Apply perspective transform
-    pts = screenCnt.reshape(4, 2) * ratio
-    
-    # Order points: top-left, top-right, bottom-right, bottom-left
+def _order_points(pts):
+    """Return corners in (top-left, top-right, bottom-right, bottom-left) order."""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
     rect[2] = pts[np.argmax(s)]
-    
     diff = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
-    
-    (tl, tr, br, bl) = rect
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-    
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-    
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-        
+    return rect
+
+def _score_quad(approx, img_area):
+    """
+    Score a 4-point contour. Returns -1 to reject, or a positive float (higher = better).
+    Criteria: minimum area coverage, convexity, and near-rectangular angles.
+    """
+    area = cv2.contourArea(approx)
+    if area < img_area * 0.05:
+        return -1
+    if not cv2.isContourConvex(approx):
+        return -1
+
+    pts = _order_points(approx.reshape(4, 2).astype("float32"))
+    cos_angles = []
+    for i in range(4):
+        v1 = pts[(i + 1) % 4] - pts[i]
+        v2 = pts[(i - 1) % 4] - pts[i]
+        denom = np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6
+        cos_angles.append(abs(np.dot(v1, v2) / denom))
+
+    # cos near 0 means angle near 90°; reject very non-rectangular quads
+    if np.mean(cos_angles) > 0.5:
+        return -1
+
+    return (area / img_area) * (1 - np.mean(cos_angles))
+
+def _find_best_quad(edges, img_area, upscale=1.0):
+    """Scan contours in edge image and return the best document quad (scaled back up)."""
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:20]
+
+    best_score, best_quad = -1, None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        for eps in [0.01, 0.02, 0.03, 0.04, 0.06]:
+            approx = cv2.approxPolyDP(c, eps * peri, True)
+            if len(approx) == 4:
+                score = _score_quad(approx, img_area)
+                if score > best_score:
+                    best_score = score
+                    best_quad = approx
+                break  # one quad per contour
+
+    if best_quad is not None:
+        return (best_quad.reshape(4, 2) * upscale).astype("float32")
+    return None
+
+def apply_document_crop(img):
+    orig = img.copy()
+    h, w = img.shape[:2]
+
+    # Downscale longest edge to 1024 px for fast processing
+    scale = min(1.0, 1024.0 / max(h, w))
+    small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1.0 else img.copy()
+    sh, sw = small.shape[:2]
+    small_area = sh * sw
+    upscale = 1.0 / scale
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+    # Strategy 1: bilateral filter (edge-preserving) + adaptive Canny
+    bilateral = cv2.bilateralFilter(small, 9, 75, 75)
+    gray1 = cv2.cvtColor(bilateral, cv2.COLOR_BGR2GRAY)
+    edges1 = _auto_canny(gray1)
+    edges1 = cv2.dilate(edges1, np.ones((3, 3), np.uint8), iterations=1)
+    quad = _find_best_quad(edges1, small_area, upscale)
+
+    # Strategy 2: Gaussian + wider Canny + morphological closing
+    if quad is None:
+        gray2 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        blur2 = cv2.GaussianBlur(gray2, (5, 5), 0)
+        edges2 = cv2.Canny(blur2, 30, 90)
+        edges2 = cv2.morphologyEx(edges2, cv2.MORPH_CLOSE, close_kernel)
+        quad = _find_best_quad(edges2, small_area, upscale)
+
+    # Strategy 3: adaptive threshold → Canny + aggressive closing
+    if quad is None:
+        gray3 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        thresh = cv2.adaptiveThreshold(gray3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 21, 10)
+        edges3 = cv2.Canny(thresh, 10, 50)
+        big_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        edges3 = cv2.morphologyEx(edges3, cv2.MORPH_CLOSE, big_kernel)
+        quad = _find_best_quad(edges3, small_area, upscale)
+
+    if quad is None:
+        return orig
+
+    rect = _order_points(quad)
+    tl, tr, br, bl = rect
+    maxWidth  = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
+    maxHeight = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
+
+    if maxWidth < 100 or maxHeight < 100:
+        return orig
+
+    dst = np.array([[0, 0], [maxWidth - 1, 0],
+                    [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
-    
-    return warped
+    return cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
+
+def apply_deskew(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = img.shape[:2]
+
+    # Primary: Hough lines give a robust median angle
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=max(50, min(h, w) // 4))
+    if lines is not None:
+        angles = []
+        for line in lines:
+            theta = line[0][1]
+            angle = np.degrees(theta) - 90  # map to [-90, 90]
+            # Only keep near-horizontal lines (document text rows)
+            if -20 <= angle <= 20:
+                angles.append(angle)
+        if len(angles) >= 3:
+            skew = np.median(angles)
+            if 0.3 <= abs(skew) <= 20:
+                M = cv2.getRotationMatrix2D((w / 2, h / 2), skew, 1.0)
+                return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
+                                      borderMode=cv2.BORDER_REPLICATE)
+
+    # Fallback: minAreaRect on thresholded text pixels
+    inv = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) == 0:
+        return img
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    if abs(angle) < 0.3 or abs(angle) > 20:
+        return img
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
