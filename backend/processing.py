@@ -96,12 +96,16 @@ def process_image(img_bytes, options):
 
     return _encode_image(img)
 
-def auto_scan(img_bytes, mode='color'):
+def auto_scan(img_bytes, mode='color', corners=None):
     img = _decode_image(img_bytes)
     if img is None:
         raise ValueError("Invalid image")
 
-    img = apply_document_crop(img)
+    if corners is not None:
+        rect = _order_points(np.array(corners, dtype="float32"))
+        img = _four_point_transform(img, rect)
+    else:
+        img = apply_document_crop(img)
     img = apply_deskew(img)
 
     if mode == 'bw':
@@ -219,23 +223,21 @@ def _grabcut_quad(img, img_area, upscale=1.0):
 
     return _find_best_quad(canny, img_area, upscale)
 
-def apply_document_crop(img):
-    orig = img.copy()
+def detect_document_corners(img):
+    """
+    Run the multi-strategy corner detector.
+    Returns a (4, 2) float32 array ordered [TL, TR, BR, BL] in image pixels, or None.
+    """
     h, w = img.shape[:2]
-
-    # Downscale longest edge to 1080 px for fast processing
     scale = min(1.0, 1080.0 / max(h, w))
     small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1.0 else img.copy()
     sh, sw = small.shape[:2]
     small_area = sh * sw
     upscale = 1.0 / scale
-
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    # Strategy 1 (primary): GrabCut — robust against complex backgrounds
     quad = _grabcut_quad(small, small_area, upscale)
 
-    # Strategy 2: bilateral filter (edge-preserving) + adaptive Canny
     if quad is None:
         bilateral = cv2.bilateralFilter(small, 9, 75, 75)
         gray1 = cv2.cvtColor(bilateral, cv2.COLOR_BGR2GRAY)
@@ -243,7 +245,6 @@ def apply_document_crop(img):
         edges1 = cv2.dilate(edges1, np.ones((3, 3), np.uint8), iterations=1)
         quad = _find_best_quad(edges1, small_area, upscale)
 
-    # Strategy 3: Gaussian + wider Canny + morphological closing
     if quad is None:
         gray2 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         blur2 = cv2.GaussianBlur(gray2, (5, 5), 0)
@@ -251,7 +252,6 @@ def apply_document_crop(img):
         edges2 = cv2.morphologyEx(edges2, cv2.MORPH_CLOSE, close_kernel)
         quad = _find_best_quad(edges2, small_area, upscale)
 
-    # Strategy 4: adaptive threshold → Canny + aggressive closing
     if quad is None:
         gray3 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         thresh = cv2.adaptiveThreshold(gray3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -262,20 +262,29 @@ def apply_document_crop(img):
         quad = _find_best_quad(edges3, small_area, upscale)
 
     if quad is None:
-        return orig
+        return None
 
-    rect = _order_points(quad)
+    return _order_points(quad)  # (4, 2) float32
+
+
+def _four_point_transform(img, rect):
+    """Perspective warp given ordered corners [TL, TR, BR, BL] as (4,2) float32."""
     tl, tr, br, bl = rect
     maxWidth  = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
     maxHeight = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
-
     if maxWidth < 100 or maxHeight < 100:
-        return orig
-
+        return img
     dst = np.array([[0, 0], [maxWidth - 1, 0],
                     [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
+    return cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+
+
+def apply_document_crop(img):
+    rect = detect_document_corners(img)
+    if rect is None:
+        return img
+    return _four_point_transform(img, rect)
 
 def apply_deskew(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)

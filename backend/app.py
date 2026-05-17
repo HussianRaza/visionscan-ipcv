@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import json
 
-from processing import process_image, auto_scan
+from processing import process_image, auto_scan, detect_document_corners, _decode_image
 from ocr import extract_text
 from pdf_export import create_pdf
 
@@ -73,14 +73,42 @@ async def process_ocr(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/detect-corners")
+async def detect_corners_endpoint(file: UploadFile = File(...)):
+    try:
+        img_bytes = await file.read()
+        img = _decode_image(img_bytes)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Invalid image")
+        h, w = img.shape[:2]
+        corners = detect_document_corners(img)
+        if corners is None:
+            corners = [[0, 0], [w, 0], [w, h], [0, h]]
+        else:
+            corners = corners.tolist()
+        return {"corners": corners, "width": w, "height": h}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/auto-scan")
 async def auto_scan_endpoint(
     file: UploadFile = File(...),
     mode: str = Form(default="color"),
+    corners: str = Form(default=""),
 ):
     try:
         img_bytes = await file.read()
-        processed_bytes = auto_scan(img_bytes, mode)
+        user_corners = None
+        if corners:
+            try:
+                parsed = json.loads(corners)
+                if len(parsed) == 4:
+                    user_corners = parsed
+            except Exception:
+                pass
+        processed_bytes = auto_scan(img_bytes, mode, user_corners)
         return Response(content=processed_bytes, media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

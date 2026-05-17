@@ -18,6 +18,7 @@ import {
   rectSortingStrategy,
 } from '@dnd-kit/sortable';
 import { SortableImage } from '@/components/sortable-image';
+import { CropOverlay } from '@/components/crop-overlay';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
@@ -36,12 +37,16 @@ import {
 import { toast, Toaster } from 'sonner';
 import { ThemeToggle } from '@/components/theme-toggle';
 
+type Corner = [number, number];
+
 interface ImageItem {
   id: string;
   file: File;
   originalUrl: string;
   processedUrl?: string;
   extractedText?: string;
+  corners?: Corner[];
+  naturalSize?: { width: number; height: number };
 }
 
 interface ProcessingOptions {
@@ -101,8 +106,27 @@ export default function Home() {
   const [fileName, setFileName] = useState('document');
   const [isWakingUp, setIsWakingUp] = useState(false);
   const coldStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewContainerRef = useRef<HTMLDivElement | null>(null);
+  const previewImgRef = useRef<HTMLImageElement | null>(null);
 
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+  const detectCorners = useCallback(async (img: ImageItem) => {
+    if (img.corners) return; // already detected
+    try {
+      const fd = new FormData();
+      fd.append('file', img.file);
+      const res = await fetch(`${apiUrl}/detect-corners`, { method: 'POST', body: fd });
+      if (!res.ok) return;
+      const data = await res.json();
+      setImages(prev => prev.map(i =>
+        i.id === img.id
+          ? { ...i, corners: data.corners, naturalSize: { width: data.width, height: data.height } }
+          : i
+      ));
+    } catch { /* silent */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiUrl]);
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -126,8 +150,12 @@ export default function Home() {
       originalUrl: URL.createObjectURL(file),
     }));
     setImages(prev => [...prev, ...newImages]);
-    setActiveId(prev => prev ?? (newImages.length > 0 ? newImages[0].id : null));
-  }, []);
+    setActiveId(prev => {
+      const firstId = prev ?? (newImages.length > 0 ? newImages[0].id : null);
+      if (!prev && newImages.length > 0) detectCorners(newImages[0]);
+      return firstId;
+    });
+  }, [detectCorners]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -161,6 +189,8 @@ export default function Home() {
   const handleSetActive = (id: string) => {
     setActiveId(id);
     setShowingOriginal(false);
+    const img = images.find(i => i.id === id);
+    if (img) detectCorners(img);
   };
 
   const startColdStartTimer = () => {
@@ -228,6 +258,7 @@ export default function Home() {
       const formData = new FormData();
       formData.append('file', activeImage.file);
       formData.append('mode', scanMode);
+      if (activeImage.corners) formData.append('corners', JSON.stringify(activeImage.corners));
       const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
       cancelColdStartTimer();
       if (!response.ok) throw new Error();
@@ -256,6 +287,7 @@ export default function Home() {
         const formData = new FormData();
         formData.append('file', img.file);
         formData.append('mode', scanMode);
+        if (img.corners) formData.append('corners', JSON.stringify(img.corners));
         const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
         cancelColdStartTimer();
         if (!response.ok) throw new Error();
@@ -745,12 +777,13 @@ export default function Home() {
             </div>
 
             {/* Preview area */}
-            <div className="flex-1 relative overflow-hidden bg-muted/20 min-h-0">
+            <div ref={previewContainerRef} className="flex-1 relative overflow-hidden bg-muted/20 min-h-0">
               {activeImage ? (
                 <>
                   <div className="absolute inset-0 flex items-center justify-center p-6 lg:p-10">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
+                      ref={previewImgRef}
                       src={
                         showingOriginal
                           ? activeImage.originalUrl
@@ -761,6 +794,23 @@ export default function Home() {
                       style={{ opacity: (isAutoScanning || isProcessing) ? 0.4 : 1 }}
                     />
                   </div>
+
+                  {/* Crop overlay — shown when viewing the original */}
+                  {(showingOriginal || !activeImage.processedUrl) &&
+                   activeImage.corners && activeImage.naturalSize && (
+                    <CropOverlay
+                      corners={activeImage.corners}
+                      naturalWidth={activeImage.naturalSize.width}
+                      naturalHeight={activeImage.naturalSize.height}
+                      imgRef={previewImgRef}
+                      containerRef={previewContainerRef}
+                      onChange={pts =>
+                        setImages(prev => prev.map(i =>
+                          i.id === activeId ? { ...i, corners: pts } : i
+                        ))
+                      }
+                    />
+                  )}
 
                   {/* Before/After toggle */}
                   {activeImage.processedUrl && (
