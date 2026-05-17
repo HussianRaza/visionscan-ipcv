@@ -2,13 +2,34 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from typing import List, Optional
+from contextlib import asynccontextmanager
+import asyncio
+import httpx
 import json
 
 from processing import process_image, auto_scan
 from ocr import extract_text
 from pdf_export import create_pdf
 
-app = FastAPI(title="IPCV Image-to-PDF API", version="1.0.0")
+PING_INTERVAL = 4 * 60  # 4 minutes — HF Spaces hibernates after ~15 min
+
+async def _keepalive():
+    await asyncio.sleep(30)  # let server finish starting up
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await client.get("http://localhost:7860/health", timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(PING_INTERVAL)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_keepalive())
+    yield
+    task.cancel()
+
+app = FastAPI(title="IPCV Image-to-PDF API", version="1.0.0", lifespan=lifespan)
 
 # Allow CORS for all domains
 app.add_middleware(
