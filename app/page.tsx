@@ -26,7 +26,7 @@ import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { UploadCloud, Wand2, FileText, Download, Settings, Loader2, ImagePlus, Copy } from 'lucide-react';
+import { UploadCloud, Wand2, FileText, Download, Settings, Loader2, ImagePlus, Copy, ScanLine } from 'lucide-react';
 import { toast, Toaster } from 'sonner';
 
 import { ThemeToggle } from '@/components/theme-toggle';
@@ -72,6 +72,9 @@ export default function Home() {
   const [processProgress, setProcessProgress] = useState<{ current: number; total: number } | null>(null);
   const [ocrProgress, setOcrProgress] = useState<{ current: number; total: number } | null>(null);
   const [searchablePdf, setSearchablePdf] = useState(false);
+  const [scanMode, setScanMode] = useState<'color' | 'grayscale' | 'bw'>('color');
+  const [isAutoScanning, setIsAutoScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<{ current: number; total: number } | null>(null);
   const [apiUrl, setApiUrl] = useState(
     process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
   );
@@ -263,6 +266,61 @@ export default function Home() {
     toast.success('OCR complete on all images!');
   };
 
+  const handleAutoScan = async () => {
+    if (!activeImage) return;
+    setIsAutoScanning(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', activeImage.file);
+      formData.append('mode', scanMode);
+
+      const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
+      if (!response.ok) throw new Error('Auto scan failed');
+
+      const blob = await response.blob();
+      const processedUrl = URL.createObjectURL(blob);
+      setImages(prev => prev.map(img =>
+        img.id === activeId ? { ...img, processedUrl } : img
+      ));
+      toast.success('Image scanned successfully!');
+    } catch (error) {
+      console.error(error);
+      toast.error('Auto scan failed. Check backend connection.');
+    } finally {
+      setIsAutoScanning(false);
+    }
+  };
+
+  const handleAutoScanAll = async () => {
+    if (images.length === 0) return;
+    const snapshot = [...images];
+    setScanProgress({ current: 0, total: snapshot.length });
+
+    for (let i = 0; i < snapshot.length; i++) {
+      setScanProgress({ current: i + 1, total: snapshot.length });
+      const img = snapshot[i];
+      try {
+        const formData = new FormData();
+        formData.append('file', img.file);
+        formData.append('mode', scanMode);
+
+        const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
+        if (!response.ok) throw new Error('Auto scan failed');
+
+        const blob = await response.blob();
+        const processedUrl = URL.createObjectURL(blob);
+        setImages(prev => prev.map(item =>
+          item.id === img.id ? { ...item, processedUrl } : item
+        ));
+      } catch {
+        toast.error(`Failed to scan page ${i + 1}.`);
+      }
+    }
+
+    setScanProgress(null);
+    toast.success('All pages scanned!');
+  };
+
   const handleCopyAllText = () => {
     const allText = images
       .filter(img => img.extractedText)
@@ -338,6 +396,7 @@ export default function Home() {
   const hasAnyText = images.some(img => img.extractedText);
   const isBatchProcessing = processProgress !== null;
   const isBatchOCR = ocrProgress !== null;
+  const isBatchAutoScan = scanProgress !== null;
 
   return (
     <div className="min-h-screen bg-background text-foreground font-sans">
@@ -381,6 +440,58 @@ export default function Home() {
       <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         {/* Left Sidebar - Tools */}
         <div className="lg:col-span-3 space-y-6">
+          <Card className="shadow-sm border-primary/30 bg-primary/5">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base font-medium flex items-center gap-2">
+                <ScanLine className="w-4 h-4 text-primary" />
+                Auto Scan
+              </CardTitle>
+              <CardDescription>Detect, crop & enhance in one click</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex rounded-lg border border-border overflow-hidden text-xs font-medium">
+                {(['color', 'grayscale', 'bw'] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setScanMode(m)}
+                    className={`flex-1 py-2 transition-colors ${
+                      scanMode === m
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-background text-muted-foreground hover:bg-muted'
+                    }`}
+                  >
+                    {m === 'color' ? 'Color' : m === 'grayscale' ? 'Grey' : 'B&W'}
+                  </button>
+                ))}
+              </div>
+              <Button
+                className="w-full"
+                onClick={handleAutoScan}
+                disabled={!activeImage || isAutoScanning || isBatchAutoScan}
+              >
+                {isAutoScanning
+                  ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  : <ScanLine className="w-4 h-4 mr-2" />}
+                Scan Selected
+              </Button>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={handleAutoScanAll}
+                disabled={images.length === 0 || isAutoScanning || isBatchAutoScan}
+              >
+                {isBatchAutoScan ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Scanning {scanProgress?.current} / {scanProgress?.total}
+                  </>
+                ) : (
+                  'Scan All Pages'
+                )}
+              </Button>
+            </CardContent>
+          </Card>
+
           <Card className="shadow-sm border-border">
             <CardHeader className="pb-4">
               <CardTitle className="text-base font-medium flex items-center gap-2">

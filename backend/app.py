@@ -4,7 +4,7 @@ from fastapi.responses import Response
 from typing import List, Optional
 import json
 
-from processing import process_image
+from processing import process_image, auto_scan
 from ocr import extract_text
 from pdf_export import create_pdf
 
@@ -49,6 +49,18 @@ async def process_ocr(file: UploadFile = File(...)):
         img_bytes = await file.read()
         text = extract_text(img_bytes)
         return {"text": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/auto-scan")
+async def auto_scan_endpoint(
+    file: UploadFile = File(...),
+    mode: str = Form(default="color"),
+):
+    try:
+        img_bytes = await file.read()
+        processed_bytes = auto_scan(img_bytes, mode)
+        return Response(content=processed_bytes, media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -96,6 +96,37 @@ def process_image(img_bytes, options):
 
     return _encode_image(img)
 
+def auto_scan(img_bytes, mode='color'):
+    img = _decode_image(img_bytes)
+    if img is None:
+        raise ValueError("Invalid image")
+
+    img = apply_document_crop(img)
+    img = apply_deskew(img)
+
+    if mode == 'bw':
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        img = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    elif mode == 'grayscale':
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+        gray = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    else:  # color — magic color mode
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        img = cv2.cvtColor(cv2.merge((l, a, b_ch)), cv2.COLOR_LAB2BGR)
+        blurred = cv2.GaussianBlur(img, (0, 0), 3)
+        img = cv2.addWeighted(img, 1.5, blurred, -0.5, 0)
+
+    return _encode_image(img)
+
 def apply_deskew(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.bitwise_not(gray)
