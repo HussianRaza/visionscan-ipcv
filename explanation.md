@@ -24,15 +24,17 @@ A document scanning web app that turns phone photos of documents into clean, sea
 ```
 Browser (Next.js)
       │
-      │  HTTP multipart/form-data  (images + options)
+      │  HTTP multipart/form-data  (images + options/corners)
       │
       ▼
 Hugging Face Docker Space (FastAPI / Uvicorn, port 7860)
       │
-      ├── /process        OpenCV manual filters
-      ├── /auto-scan      Full document pipeline
-      ├── /ocr            Tesseract text extraction
-      └── /export-pdf     fpdf2 or pytesseract PDF assembly
+      ├── /health          Keepalive ping target
+      ├── /detect-corners  Return auto-detected document corners as JSON
+      ├── /auto-scan       Full document pipeline (crop → deskew → enhance)
+      ├── /process         OpenCV manual filters
+      ├── /ocr             Tesseract text extraction
+      └── /export-pdf      fpdf2 or pytesseract PDF assembly
 ```
 
 The frontend and backend are completely decoupled. The frontend sends raw or processed images as binary blobs in `multipart/form-data` requests. The backend returns either a JPEG blob (for image endpoints) or a PDF blob. No session state, no database, no auth. Everything lives in the browser until the user downloads the PDF.
@@ -64,15 +66,21 @@ The split deployment exists because:
 
 ```
 app/
-  layout.tsx        Root layout — font loading, ThemeProvider, metadata
-  page.tsx          Entire application (single-page, client component)
-  globals.css       Tailwind imports + CSS variable theme tokens
+  layout.tsx          Root layout — font loading, ThemeProvider, metadata
+  page.tsx            Entire application (single-page, client component)
+  globals.css         Tailwind imports + CSS variable theme tokens
+  api/
+    keepalive/
+      route.ts        Edge API route — pings backend /health (Vercel Cron target)
 
 components/
   sortable-image.tsx    Draggable thumbnail card
+  crop-overlay.tsx      Interactive SVG crop boundary with draggable corners
   theme-toggle.tsx      Light/dark toggle button
   theme-provider.tsx    next-themes wrapper
   ui/                   shadcn primitives (button, switch, input, etc.)
+
+vercel.json             Vercel Cron Job — calls /api/keepalive every 5 minutes
 ```
 
 ### `app/page.tsx` — State
@@ -95,17 +103,27 @@ searchablePdf: boolean          // Whether to embed OCR text layer in PDF
 isWakingUp: boolean            // Cold-start warning (HF Spaces)
 ```
 
+Two refs are used by the crop overlay:
+```ts
+previewContainerRef: RefObject<HTMLDivElement>  // Outer preview area div
+previewImgRef: RefObject<HTMLImageElement>      // The preview <img> element
+```
+
 `ImageItem` is the central data type:
 
 ```ts
 interface ImageItem {
-  id: string          // crypto.randomUUID()
-  file: File          // Original File object from the OS
-  originalUrl: string // Object URL of the original (for Before toggle)
-  processedUrl?: string  // Object URL of the last processed version
-  extractedText?: string // Raw OCR text (advanced section)
+  id: string               // crypto.randomUUID()
+  file: File               // Original File object from the OS
+  originalUrl: string      // Object URL of the original (for Before toggle)
+  processedUrl?: string    // Object URL of the last processed version
+  extractedText?: string   // Raw OCR text (advanced section)
+  corners?: Corner[]       // [TL, TR, BR, BL] in image pixel coords
+  naturalSize?: { width: number; height: number }  // Image pixel dimensions
 }
 ```
+
+`Corner` is `[number, number]` (x, y). `corners` and `naturalSize` are populated by the `detectCorners()` function when an image is first selected or uploaded.
 
 Object URLs are created with `URL.createObjectURL()` and revoked on component unmount to avoid memory leaks.
 
@@ -113,7 +131,7 @@ Object URLs are created with `URL.createObjectURL()` and revoked on component un
 
 ```
 <div h-screen flex flex-col>
-  <header />                  ← App name + theme toggle (no settings gear)
+  <header />                  ← App name + theme toggle
   {anyActive && <ProgressBanner />}   ← Sticky top bar during any operation
   {images.length === 0
     ? <EmptyState />           ← Full-page drag-drop zone
@@ -124,8 +142,9 @@ Object URLs are created with `URL.createObjectURL()` and revoked on component un
         </aside>
         <div flex-1 flex flex-col lg:flex-row>
           Mobile strip          ← Horizontal scroll row (< lg only)
-          <div flex-1>          ← Center: preview area
-            <img />
+          <div flex-1 ref={previewContainerRef}>   ← Center: preview area
+            <img ref={previewImgRef} />
+            <CropOverlay />     ← SVG overlay (shown when viewing original)
             Before/After toggle (if processed)
           </div>
           <aside w-80>          ← Right: controls panel
@@ -139,23 +158,72 @@ Object URLs are created with `URL.createObjectURL()` and revoked on component un
 </div>
 ```
 
+### Corner Detection Flow
+
+When an image is selected (`handleSetActive`) or first uploaded (`onDrop`), `detectCorners(img)` is called:
+
+1. Sends `POST /detect-corners` with the image file.
+2. Backend runs the full multi-strategy corner detector and returns `{ corners, width, height }`.
+3. `corners` (4 × [x, y] in image pixel space) and `naturalSize` are stored on the `ImageItem`.
+4. The `CropOverlay` component renders automatically since `corners` is now set.
+
+If the image already has `corners`, the call is skipped (idempotent).
+
 ### Auto Scan Flow (Single Page)
 
 1. User selects a scan mode (Color / Grey / B&W radio cards).
-2. User clicks "or scan this page only".
-3. `handleAutoScan()` starts:
+2. User optionally drags the crop overlay corners to adjust the document boundary.
+3. User clicks "or scan this page only".
+4. `handleAutoScan()` starts:
    - `setIsAutoScanning(true)` → progress banner appears.
-   - Cold-start timer starts (5 s timeout → sets `isWakingUp(true)` → banner gains "Server is starting up…" message).
-   - `FormData` is built: `file` = `activeImage.file`, `mode` = selected mode string.
+   - Cold-start timer starts (5 s timeout → sets `isWakingUp(true)`).
+   - `FormData` is built: `file`, `mode`, and `corners` (JSON-serialised if the image has corners).
    - `POST /auto-scan` is awaited.
    - On first response: timer is cancelled, `isWakingUp` reset.
    - Response blob → `URL.createObjectURL()` → stored as `processedUrl` on the image.
    - `showingOriginal` set to `false` so the after-state is shown immediately.
-4. `isAutoScanning(false)` → banner disappears.
+5. `isAutoScanning(false)` → banner disappears.
+
+When `corners` are included, the backend skips auto-detection and uses the user-provided corners directly for the perspective transform.
 
 ### Batch Auto Scan Flow
 
-Same as above but iterates all images in a `for` loop, updating `scanProgress` at each step. The cold-start timer is cancelled after the first successful response (server is warm for subsequent pages).
+Same as above but iterates all images in a `for` loop, updating `scanProgress` at each step. Each image's own `corners` (if set) are sent with its request. The cold-start timer is cancelled after the first successful response.
+
+### `CropOverlay` Component (`components/crop-overlay.tsx`)
+
+Renders an SVG positioned exactly over the preview image, showing the document boundary and 4 draggable corner handles.
+
+**Coordinate mapping:**
+
+The image is displayed with `object-contain` inside a padded flex container. Its actual rendered bounds (position + size relative to the container) are measured using `ResizeObserver`:
+
+```ts
+const iB = img.getBoundingClientRect();
+const cB = container.getBoundingClientRect();
+imgRect = { x: iB.left - cB.left, y: iB.top - cB.top, w: iB.width, h: iB.height }
+```
+
+Scale factors map between image-pixel and display-pixel space:
+```ts
+scaleX = imgRect.w / naturalWidth
+scaleY = imgRect.h / naturalHeight
+```
+
+**SVG layout:**
+
+- Positioned `absolute` within the preview container using `imgRect.x / y / w / h`.
+- An SVG mask dims everything outside the crop quad, giving a clear visual crop preview.
+- A blue polygon outlines the crop boundary.
+- Each corner has a white circle handle with a crosshair, plus a larger invisible hit area (2× radius) for easy targeting.
+
+**Dragging:**
+
+`pointerdown` on a handle adds `document.addEventListener('pointermove')` and `pointerup`. This keeps dragging smooth even when the pointer moves outside the handle circle. On each `pointermove`, the raw client position is converted back to image-pixel space via the inverse scale factors, clamped to image bounds, and `onChange` is called to update React state.
+
+**Visibility:**
+
+The overlay is shown when `showingOriginal || !activeImage.processedUrl` — i.e. whenever the preview is displaying the original image. It hides when showing the processed "After" result.
 
 ### Drag-and-Drop Reordering
 
@@ -167,7 +235,7 @@ The preview renders either `activeImage.originalUrl` or `activeImage.processedUr
 
 ### ScrollArea Fix
 
-The left thumbnail sidebar uses `ScrollArea` from `@base-ui/react`. In CSS flexbox, a flex child's minimum height defaults to `auto` (intrinsic content size), which prevents the element from shrinking below its content and breaks scroll. The fix is `min-h-0` on the `ScrollArea` alongside `overflow-hidden` on the `aside`. Without these, the ScrollArea expands to show all thumbnails rather than clipping and scrolling.
+The left thumbnail sidebar uses `ScrollArea` from `@base-ui/react`. In CSS flexbox, a flex child's minimum height defaults to `auto` (intrinsic content size), which prevents the element from shrinking below its content and breaks scroll. The fix is `min-h-0` on the `ScrollArea` alongside `overflow-hidden` on the `aside`.
 
 ### `SortableImage` Component
 
@@ -176,7 +244,7 @@ Props: `id`, `url`, `pageNumber`, `isProcessed`, `isActive`, `onClick`, `onRemov
 - Page number badge: permanent overlay at bottom-left (`bg-black/60`).
 - Processed indicator: green checkmark at top-right, shown when `isProcessed` and not hovering.
 - Drag handle: appears at top-left on hover (`group-hover:opacity-100`).
-- Delete button: appears at top-right on hover, replacing the processed indicator (`group-hover:opacity-100` + `group-hover:hidden` on the checkmark).
+- Delete button: appears at top-right on hover, replacing the processed indicator.
 - Active selection: `ring-2 ring-primary ring-offset-2` border.
 
 ---
@@ -196,16 +264,56 @@ Props: `id`, `url`, `pageNumber`, `isProcessed`, `isActive`, `onClick`, `onRemov
 | fpdf2 | PDF generation (image-only mode) |
 | pypdf | PDF reading and merging (searchable mode) |
 | python-multipart | FastAPI multipart form parsing |
+| httpx | Async HTTP client used by the self-ping keepalive loop |
 
 System packages (installed via APT in Docker):
 - `tesseract-ocr` — OCR engine binary
 - `libgl1` — OpenGL shared library required by OpenCV on headless servers
 - `libglib2.0-0` — GLib runtime required by OpenCV
 
+### Keepalive — Self-Ping
+
+HF Spaces free tier hibernates after ~15 minutes of inactivity. On startup, `app.py` launches a background asyncio task that pings `localhost:7860/health` every 4 minutes, keeping the Space permanently warm:
+
+```python
+async def _keepalive():
+    await asyncio.sleep(30)  # let server finish starting up
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await client.get("http://localhost:7860/health", timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(240)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_keepalive())
+    yield
+    task.cancel()
+```
+
+The task is registered via FastAPI's `lifespan` context manager and cancelled cleanly on shutdown.
+
 ### `app.py` — Endpoints
 
 #### `GET /health`
-Returns `{"status": "ok"}`. Used by the frontend to detect whether the server is alive (and implicitly to detect cold starts — a slow response to this endpoint is the first signal).
+Returns `{"status": "ok"}`. Target of the self-ping keepalive and the Vercel Cron job via `/api/keepalive`.
+
+#### `POST /detect-corners`
+Accepts: `file` (UploadFile).
+
+Runs the full multi-strategy corner detector on the uploaded image. Returns the 4 document corners in image pixel coordinates plus the image's natural dimensions:
+
+```json
+{
+  "corners": [[x0,y0], [x1,y1], [x2,y2], [x3,y3]],
+  "width": 3024,
+  "height": 4032
+}
+```
+
+Corners are ordered TL → TR → BR → BL. If no document boundary is detected, returns full-image corners as a fallback so the frontend always has a valid quad to display.
 
 #### `POST /process`
 Accepts: `file` (UploadFile), `options` (JSON string form field).
@@ -228,9 +336,11 @@ The `options` JSON maps directly to the `ProcessingOptions` interface from the f
 Returns: JPEG bytes (`image/jpeg`).
 
 #### `POST /auto-scan`
-Accepts: `file` (UploadFile), `mode` (form field, default `"color"`).
+Accepts: `file` (UploadFile), `mode` (form field, default `"color"`), `corners` (optional JSON form field).
 
 Mode values: `"color"`, `"grayscale"`, `"bw"`.
+
+If `corners` is provided (a JSON array of 4 `[x, y]` pairs), the backend skips auto-detection and uses those corners directly for the perspective transform. This allows user-adjusted corners from the crop overlay to be applied server-side.
 
 Returns: JPEG bytes (`image/jpeg`).
 
@@ -251,7 +361,11 @@ Returns: PDF bytes (`application/pdf`) with `Content-Disposition: attachment`.
 
 ## 4. Image Processing Pipeline
 
-All image processing lives in `backend/processing.py`. The two entry points are `process_image()` (manual filters) and `auto_scan()` (full automated pipeline).
+All image processing lives in `backend/processing.py`. The public entry points are:
+
+- `detect_document_corners(img)` — corner detection only, returns `(4,2) float32` or `None`
+- `process_image(img_bytes, options)` — manual filter pipeline
+- `auto_scan(img_bytes, mode, corners=None)` — full automated pipeline
 
 ### Image Encoding / Decoding
 
@@ -265,72 +379,138 @@ def _encode_image(img):
     return buffer.tobytes()
 ```
 
-Images arrive as raw bytes from the HTTP body. `np.frombuffer` wraps them in a NumPy array without copying. `cv2.imdecode` decodes JPEG/PNG/WebP into a BGR NumPy array (height × width × 3, uint8). The output is re-encoded as JPEG for the HTTP response.
+Images arrive as raw bytes from the HTTP body. `np.frombuffer` wraps them in a NumPy array without copying. `cv2.imdecode` decodes JPEG/PNG/WebP into a BGR NumPy array (height × width × 3, uint8).
 
-### `apply_document_crop()` — Perspective Transform
+### `detect_document_corners()` — Multi-Strategy Corner Detection
 
-This is the most complex operation. It finds the document rectangle in the image and performs a perspective warp to produce a flat, top-down view.
+Runs four strategies in order, returning the result of the first that succeeds. All strategies operate on a copy downscaled to a maximum of 1080px on the longest edge for speed; corners are scaled back to full resolution before returning.
 
-**Steps:**
+#### Strategy 1 (Primary): GrabCut Segmentation
 
-1. **Resize to 500px height** — Canny edge detection and contour finding are expensive. Working on a downscaled copy is fast and the result maps back to full resolution.
+Inspired by the LearnOpenCV automatic document scanner. GrabCut is a graph-cut segmentation algorithm that iteratively models foreground and background colour distributions using Gaussian Mixture Models.
 
-2. **Grayscale → Gaussian blur → Canny edges** — `cv2.Canny(blurred, 75, 200)` finds edges with hysteresis thresholding. The lower threshold (75) passes edges that connect to high-confidence edges (200).
+```
+Morphological Closing (5×5, 3 iterations)
+    │   Removes text/detail → document surface becomes a uniform blob
+    ▼
+GrabCut (rect inset 20px from edges, 5 iterations)
+    │   Separates document (foreground) from desk/table (background)
+    ▼
+Foreground mask applied to closed image
+    ▼
+Gaussian Blur (11×11) → Canny (0–200) → Elliptical Dilation (5×5)
+    ▼
+Contour → Quad detection & scoring
+```
 
-3. **Find contours → sort by area → take top 5** — `cv2.findContours` with `RETR_LIST` (flat list, no hierarchy) and `CHAIN_APPROX_SIMPLE` (compress horizontal/vertical runs to endpoints). Taking the top 5 largest contours eliminates noise.
+Morphological closing before GrabCut is essential — it suppresses text strokes that would otherwise confuse the foreground/background colour model.
 
-4. **Approximate polygon → find quadrilateral** — `cv2.approxPolyDP` with epsilon = 2% of perimeter simplifies each contour. The first contour that simplifies to exactly 4 points is the document boundary (`screenCnt`).
+#### Strategy 2: Bilateral Filter + Adaptive Canny
 
-5. **Scale corners back to full resolution** — multiply the 4 corner points by the downscale ratio.
+`cv2.bilateralFilter(9, 75, 75)` preserves sharp edges while smoothing flat regions. Canny thresholds are derived adaptively from the image median:
 
-6. **Order corners** — four-point ordering: top-left (minimum sum of x+y), bottom-right (maximum sum), top-right (minimum diff of y-x), bottom-left (maximum diff). This works because sums/diffs are geometric invariants of a rectangle's corners.
+```python
+v = np.median(gray)
+lower = int(max(0, (1 - 0.33) * v))
+upper = int(min(255, (1 + 0.33) * v))
+```
 
-7. **Compute output dimensions** — measure the widths and heights of the top/bottom and left/right edges of the detected quadrilateral. Take the maximum of each to produce an output rectangle that preserves as much resolution as possible.
+This handles both dark and bright document backgrounds automatically. Detected edges are dilated by a 3×3 kernel to bridge small gaps.
 
-8. **`cv2.getPerspectiveTransform` + `cv2.warpPerspective`** — compute the 3×3 homography matrix from the 4 source corners to the 4 destination corners, then apply it to the full-resolution original image.
+#### Strategy 3: Gaussian + Morphological Closing
 
-If no quadrilateral is found (e.g., the document fills the frame, or the background is too complex), the function returns the original image unchanged — a safe fallback.
+Standard `GaussianBlur(5,5)` preprocessing, Canny with fixed thresholds (30–90), then `cv2.MORPH_CLOSE` with a 5×5 kernel to bridge edge gaps caused by document texture.
+
+#### Strategy 4: Adaptive Threshold + Canny
+
+`cv2.adaptiveThreshold` with Gaussian weighting computes a local threshold per pixel from its 21×21 neighbourhood. Effective for documents with shadows or uneven illumination. A 9×9 morphological close is applied after Canny.
+
+#### Quad Scoring and Selection (`_find_best_quad`)
+
+For each strategy, the top 20 contours by area are checked. Each is approximated at five epsilon values (1%, 2%, 3%, 4%, 6% of perimeter) using `cv2.approxPolyDP`. A 4-point result is scored by `_score_quad`:
+
+1. **Minimum area:** must cover ≥ 5% of the working image area
+2. **Convexity:** `cv2.isContourConvex` must return true
+3. **Angle regularity:** mean cosine of interior angles must be < 0.5 (i.e. angles near 90°)
+4. **Score:** `(area / img_area) × (1 − mean_cos_angle)` — larger, more rectangular quads score higher
+
+The highest-scoring valid quad wins. Corners are scaled back to full-resolution coordinates via `upscale = 1.0 / scale`.
+
+### `_four_point_transform()` — Perspective Warp
+
+Given ordered corners [TL, TR, BR, BL], applies a homographic perspective warp:
+
+```python
+maxWidth  = max(‖BR − BL‖, ‖TR − TL‖)
+maxHeight = max(‖TR − BR‖, ‖TL − BL‖)
+
+dst = [[0,0], [W-1,0], [W-1,H-1], [0,H-1]]
+
+M = cv2.getPerspectiveTransform(src_corners, dst)
+warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+```
+
+`maxWidth` and `maxHeight` are computed from the actual edge lengths of the detected quadrilateral, preserving the document's true aspect ratio.
+
+### `apply_document_crop()`
+
+Thin wrapper — calls `detect_document_corners`, then `_four_point_transform`. Returns the original image if no corners are found.
 
 ### `apply_deskew()` — Rotation Correction
 
-Corrects small rotational skew caused by holding the camera at a slight angle.
+Corrects small rotational skew caused by a tilted camera.
 
-**Steps:**
+**Primary method — Hough Lines:**
 
-1. **Grayscale → invert → Otsu threshold** — `cv2.THRESH_BINARY | cv2.THRESH_OTSU` computes the optimal global threshold automatically. Inverting the image first makes dark text on white paper appear as white pixels on black — the convention needed for `minAreaRect`.
+```
+GaussianBlur(5,5) → Canny(50,150) → HoughLines
+    │
+    ▼
+Filter lines to those with angle in [−20°, 20°] (near-horizontal text rows)
+    │
+    ▼
+Median angle across all qualifying lines (robust to outlier lines)
+    │
+    ▼
+Rotate by median angle if |angle| ∈ [0.3°, 20°]
+```
 
-2. **Get all non-zero pixel coordinates** — `np.column_stack(np.where(thresh > 0))` returns an N×2 array of (y, x) pairs.
+The median is used instead of the mean because it is unaffected by outlier lines from non-text elements (borders, figures, graphics).
 
-3. **`cv2.minAreaRect`** — fits the tightest possible rectangle around all text pixels. Its angle is the skew angle.
+**Fallback — minAreaRect:**
 
-4. **Angle normalization** — OpenCV returns angles in [-90, 0). An angle < -45° means the rectangle is rotated the other way; adjust to get the true skew.
+If fewer than 3 qualifying Hough lines are found, `cv2.minAreaRect` is fitted to all thresholded foreground pixels. The bounding rectangle's angle approximates the dominant text orientation. Applied if |angle| ∈ [0.3°, 20°].
 
-5. **Guard rails** — skip rotation if the angle is under 0.5° (negligible) or over 20° (likely wrong detection, not a skew). This prevents the function from catastrophically rotating a legitimately rotated document.
-
-6. **`cv2.getRotationMatrix2D` + `cv2.warpAffine`** — rotate with cubic interpolation (`INTER_CUBIC`) and replicate border padding to avoid black edges.
-
-### `process_image()` — Manual Filters
-
-Operations are applied in a fixed order that mirrors their visual effect:
-
-1. **Document Crop** (if enabled) — runs `apply_document_crop`. Done first so subsequent operations work on the already-corrected geometry.
-2. **Deskew** — runs `apply_deskew` on the cropped image.
-3. **Grayscale** — `cv2.cvtColor(BGR→GRAY→BGR)`. Converting back to BGR keeps the array 3-channel for downstream operations.
-4. **Contrast Enhancement (CLAHE)** — Contrast Limited Adaptive Histogram Equalization. Works in LAB color space (for color images): only the L (lightness) channel is equalized, preserving hue and saturation. `clipLimit=3.0` caps the histogram redistribution to avoid over-amplifying noise. `tileGridSize=(8,8)` divides the image into an 8×8 grid of tiles processed independently, adapting to local lighting variation.
-5. **Denoise** — `cv2.fastNlMeansDenoisingColored` (for color) or `fastNlMeansDenoising` (for grayscale). Non-local means: for each pixel, finds similar patches across the image and averages them. `h=10` is the filter strength (higher = more smoothing = more blur). Slow on large images.
-6. **Sharpen** — convolution with a 3×3 sharpening kernel `[[0,-1,0],[-1,5,-1],[0,-1,0]]`. This is a Laplacian high-pass filter combined with the original signal (the center value 5 = 1 + 4, where 4 compensates the 4 negative neighbours).
-7. **Binarize (Adaptive Threshold)** — Gaussian-weighted adaptive thresholding. Each pixel's threshold is the weighted mean of its 11×11 neighbourhood minus a constant C=2. Handles uneven lighting (e.g., shadows across a page) better than global thresholding.
-8. **Watermark** — renders text onto a blank canvas, rotates it 45°, then composites it over the image at 30% opacity using per-channel NumPy operations.
+Both methods use `cv2.INTER_CUBIC` interpolation and `cv2.BORDER_REPLICATE` border mode to avoid black edges.
 
 ### `auto_scan()` — Automated Pipeline
 
-Runs `apply_document_crop` then `apply_deskew` unconditionally, then applies mode-specific enhancement:
+```python
+def auto_scan(img_bytes, mode='color', corners=None):
+```
 
-**Color mode** — CLAHE on the LAB L-channel (preserves color), then unsharp masking via `addWeighted(img, 1.5, blurred, -0.5, 0)`. Unsharp masking = original × 1.5 − Gaussian-blurred × 0.5. Equivalent to adding the high-frequency detail signal back with amplification.
+If `corners` is provided (from the frontend crop overlay), the perspective transform uses those directly — auto-detection is skipped. Otherwise `apply_document_crop` runs the full detection pipeline.
+
+After cropping, `apply_deskew` runs unconditionally, then mode-specific enhancement:
+
+**Color mode** — CLAHE on the LAB L-channel (preserves colour), then unsharp masking via `addWeighted(img, 1.5, blurred, -0.5, 0)`.
 
 **Grayscale mode** — Convert to gray, CLAHE, then unsharp masking on the gray channel.
 
-**B&W mode** — Convert to gray, Gaussian blur (removes noise before thresholding), adaptive threshold, convert back to BGR (3-channel) for consistent JPEG encoding.
+**B&W mode** — Convert to gray, `GaussianBlur(5,5)`, adaptive threshold, convert back to BGR for consistent JPEG encoding.
+
+### `process_image()` — Manual Filters
+
+Operations are applied in a fixed order:
+
+1. **Document Crop** (if enabled) — `apply_document_crop`
+2. **Deskew** — `apply_deskew`
+3. **Grayscale** — `cv2.cvtColor(BGR→GRAY→BGR)`
+4. **Contrast Enhancement (CLAHE)** — LAB L-channel, clipLimit=3.0, tileGridSize=(8,8)
+5. **Denoise** — `cv2.fastNlMeansDenoisingColored`, h=10
+6. **Sharpen** — 3×3 Laplacian kernel `[[0,-1,0],[-1,5,-1],[0,-1,0]]`
+7. **Binarize** — adaptive Gaussian threshold, 11×11 neighbourhood, C=2
+8. **Watermark** — text rendered on blank canvas, rotated 45°, composited at 30% opacity
 
 ---
 
@@ -338,7 +518,7 @@ Runs `apply_document_crop` then `apply_deskew` unconditionally, then applies mod
 
 `backend/ocr.py` wraps `pytesseract.image_to_string()`.
 
-Pre-processing: convert to grayscale. Tesseract internally handles most lighting issues, so minimal preprocessing is done here. The gray image is passed directly to `pytesseract.image_to_string()` which calls the `tesseract` binary via subprocess, returns a plain text string.
+Pre-processing: convert to grayscale. Tesseract internally handles most lighting issues, so minimal preprocessing is done here. The gray image is passed directly to `pytesseract.image_to_string()` which calls the `tesseract` binary via subprocess and returns a plain text string.
 
 In the searchable PDF path (`pdf_export.py`), `pytesseract.image_to_pdf_or_hocr(pil_img, extension='pdf')` is used instead. This returns a PDF with an invisible text layer overlaid on the image — the format that PDF readers use for Ctrl+F search. Multiple such single-page PDFs are merged using `pypdf.PdfWriter`.
 
@@ -353,20 +533,20 @@ Two code paths in `backend/pdf_export.py`:
 Uses `fpdf2`. For each image:
 1. Open with Pillow to get pixel dimensions.
 2. Write the raw bytes to a temp file (fpdf2 requires a file path, not bytes).
-3. Compute the draw dimensions: fit the image within the printable area while preserving aspect ratio (compare image AR vs page AR to decide whether to fit width or height).
+3. Compute the draw dimensions: fit the image within the printable area while preserving aspect ratio.
 4. Center on the page: `x = (page_w - draw_w) / 2`, `y = (page_h - draw_h) / 2`.
 5. `pdf.image(path, x, y, w, h)`.
 
-Output is `pdf.output(dest='S')` (return as string), encoded to `latin-1` bytes if needed (fpdf2 internal format).
+Output is `pdf.output(dest='S')` encoded to `latin-1` bytes (fpdf2 internal format).
 
 ### Searchable PDF (`_create_searchable_pdf`)
 
 Uses pytesseract + pypdf. For each image:
 1. Decode with OpenCV, convert BGR→RGB, create a Pillow Image.
-2. `pytesseract.image_to_pdf_or_hocr(pil_img, extension='pdf')` — Tesseract generates a PDF with the original image as the page background and an invisible text layer aligned to the detected words.
+2. `pytesseract.image_to_pdf_or_hocr(pil_img, extension='pdf')` — Tesseract generates a PDF with the image as background and an invisible text layer aligned to detected words.
 3. Wrap in a `PdfReader`, append to `PdfWriter`.
 
-All pages are merged into one PDF via `writer.write(output_buffer)`.
+All pages are merged via `writer.write(output_buffer)`.
 
 ---
 
@@ -391,21 +571,17 @@ pinned: false
 ```dockerfile
 FROM python:3.10-slim
 
-# Install APT packages from packages.txt
 COPY packages.txt /tmp/packages.txt
 RUN apt-get update && xargs -a /tmp/packages.txt apt-get install -y --no-install-recommends
 
-# Create non-root user (HF Spaces requirement)
 RUN useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH
 WORKDIR $HOME/app
 
-# Python dependencies
 COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code
 COPY --chown=user . .
 
 EXPOSE 7860
@@ -413,19 +589,34 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
 ```
 
 Key points:
-- **Port 7860** — HF Spaces Docker SDK routes external traffic to port 7860. The app must bind there.
-- **Non-root user** — HF Spaces requires UID 1000. The Dockerfile creates a `user` account with that UID and switches to it before installing Python packages and running the app. Files are `--chown=user` to ensure the process can read them.
-- **`packages.txt`** — APT package list read by `xargs` in the RUN command. Current contents: `tesseract-ocr`, `libgl1`, `libglib2.0-0`. This pattern allows adding system packages without editing the Dockerfile.
-- **Layer caching** — `requirements.txt` is copied and installed before the application code so that code changes don't invalidate the Python dependency layer.
+- **Port 7860** — HF Spaces routes external traffic to port 7860.
+- **Non-root user** — HF Spaces requires UID 1000.
+- **`packages.txt`** — `tesseract-ocr`, `libgl1`, `libglib2.0-0`.
+- **Layer caching** — `requirements.txt` installed before application code.
 
 **Deploying backend changes:**
 ```bash
-# From the repo root, push only the backend/ subdirectory to the HF Space remote
-git subtree push --prefix backend hf-backend main
+git subtree push --prefix backend hf main
 ```
-(Where `hf-backend` is a git remote pointing to `https://huggingface.co/spaces/<username>/<space-name>`)
+(Where `hf` is the git remote pointing to `https://huggingface.co/spaces/HussainR/visionscan-backend`)
 
-**Cold starts:** HF Spaces free tier hibernates after inactivity. The first request after hibernation takes 20–60 seconds to restart the Docker container. The frontend handles this with a 5-second timeout that shows "Waking up the server — about 30 seconds on first use" in the progress banner.
+**Keeping the Space warm:**
+
+Two mechanisms prevent hibernation:
+
+1. **Self-ping (backend):** An asyncio background task pings `localhost:7860/health` every 4 minutes — runs entirely inside the Docker container at zero network cost.
+
+2. **Vercel Cron (frontend):** `vercel.json` schedules a Vercel-side cron job every 5 minutes that calls `GET /api/keepalive` on the Next.js app, which in turn calls the backend `/health` endpoint from outside:
+
+```json
+{
+  "crons": [{ "path": "/api/keepalive", "schedule": "*/5 * * * *" }]
+}
+```
+
+The `app/api/keepalive/route.ts` edge function fetches `NEXT_PUBLIC_API_URL/health` and returns the result.
+
+**Cold starts:** Despite the keepalive, the very first request after a fresh deploy takes 20–60 seconds to restart the Docker container. The frontend handles this with a 5-second timeout that shows "Waking up the server…" in the progress banner.
 
 ### Frontend — Vercel
 
@@ -433,10 +624,10 @@ Standard Next.js deployment.
 
 1. Connect the GitHub repo to a Vercel project.
 2. Framework preset: Next.js (auto-detected).
-3. Add environment variable `NEXT_PUBLIC_API_URL` = your HF Space URL (e.g., `https://username-space-name.hf.space`).
+3. Add environment variable `NEXT_PUBLIC_API_URL` = your HF Space URL.
 4. Every push to `main` triggers a production deploy.
 
-`next.config.ts` sets `output: 'standalone'` which produces a self-contained Node.js bundle. This is required for Vercel's serverless deployment model.
+`next.config.ts` sets `output: 'standalone'` which produces a self-contained Node.js bundle.
 
 ---
 
@@ -475,10 +666,6 @@ bun run dev
 
 Frontend available at `http://localhost:3000`.
 
-### Running Both Together
-
-The frontend reads `NEXT_PUBLIC_API_URL` at build time for server components and at runtime for client components. When running locally, set it to `http://localhost:8000`. In production it points to the HF Space URL.
-
 ---
 
 ## 9. Environment Variables
@@ -487,9 +674,7 @@ The frontend reads `NEXT_PUBLIC_API_URL` at build time for server components and
 |---|---|---|
 | `NEXT_PUBLIC_API_URL` | Frontend (Vercel) | Full URL to the FastAPI backend. No trailing slash. Must be set at build time for Next.js to embed it. |
 
-The `NEXT_PUBLIC_` prefix is Next.js convention: variables with this prefix are inlined into the client-side bundle. Without it, the variable is only accessible in server-side code.
-
-The `.env.example` file also contains `GEMINI_API_KEY` and `APP_URL` which are AI Studio scaffold artifacts and are not used by the current implementation.
+The `NEXT_PUBLIC_` prefix is Next.js convention: variables with this prefix are inlined into the client-side bundle.
 
 ---
 
@@ -497,34 +682,40 @@ The `.env.example` file also contains `GEMINI_API_KEY` and `APP_URL` which are A
 
 ### Uploading Pages
 
-1. User drops files onto the upload zone (handled by `react-dropzone`'s `onDrop` callback).
-2. Each `File` object gets a stable `id` (`crypto.randomUUID()`) and an `originalUrl` (`URL.createObjectURL(file)`).
-3. The files are stored in React state (`images: ImageItem[]`). Nothing is sent to the server at this point.
+1. User drops files onto the upload zone (`react-dropzone` `onDrop`).
+2. Each `File` gets a stable `id` and an `originalUrl` (`URL.createObjectURL`).
+3. Files are stored in React state. `detectCorners` is called for the first (active) image.
+
+### Corner Detection (Background)
+
+1. Frontend sends `POST /detect-corners` with the image file.
+2. Backend runs `detect_document_corners(img)` — GrabCut → bilateral Canny → Gaussian Canny → adaptive threshold Canny (first strategy that finds a valid quad wins).
+3. Returns `{ corners: [[x,y]×4], width, height }`.
+4. Frontend stores corners + naturalSize on the `ImageItem` and re-renders the `CropOverlay`.
 
 ### Auto Scanning a Page
 
-1. Frontend sends `POST /auto-scan` with `file=<File>` and `mode=<string>`.
-2. Backend reads the image bytes, calls `auto_scan(img_bytes, mode)`.
-3. `apply_document_crop` finds the document contour and perspective-warps it.
-4. `apply_deskew` corrects rotational skew.
-5. Mode-specific enhancement (CLAHE + unsharp mask for color/grey; adaptive threshold for B&W).
-6. Returns JPEG bytes.
-7. Frontend creates a new object URL from the response blob, stores it as `processedUrl` on the `ImageItem`.
-8. Preview switches to show the processed version (`showingOriginal = false`).
+1. User optionally adjusts the crop overlay corner handles.
+2. Frontend sends `POST /auto-scan` with `file`, `mode`, and `corners` (if set).
+3. Backend:
+   - If `corners` provided: `_order_points` + `_four_point_transform` using user corners.
+   - Otherwise: `apply_document_crop` runs the full detection pipeline.
+   - `apply_deskew` corrects rotation.
+   - Mode-specific enhancement (CLAHE + unsharp mask for color/grey; adaptive threshold for B&W).
+4. Returns JPEG bytes.
+5. Frontend creates a new object URL, stores as `processedUrl`, switches to "After" view.
 
 ### Exporting as PDF
 
 1. Frontend iterates `images` in order. For each: if `processedUrl` exists, fetch the blob from the object URL; otherwise use the original `File`.
-2. All blobs are appended to a `FormData` under the key `files`. `searchable` is appended as a string.
-3. Backend receives the ordered list of image bytes.
-4. If `searchable=false`: `fpdf2` assembles a standard PDF — each image fitted to an A4 page.
-5. If `searchable=true`: pytesseract converts each image to a single-page PDF with embedded text layer, `pypdf` merges them.
-6. Frontend receives the PDF blob, creates a temporary `<a>` element with the user's chosen filename, triggers a click to download, then cleans up.
+2. All blobs appended to `FormData` under key `files`. `searchable` appended as a string.
+3. Backend assembles a PDF (image-only via fpdf2, or searchable via pytesseract + pypdf).
+4. Frontend receives PDF blob, creates a temporary `<a>` element, triggers download, cleans up.
 
 ### Manual Filters
 
-Same flow as Auto Scan but `POST /process` accepts a JSON `options` blob instead of a mode string. The options dict drives which OpenCV operations run and in what order.
+Same flow as Auto Scan but `POST /process` accepts a JSON `options` blob. The options dict drives which OpenCV operations run and in what order.
 
 ### OCR (Advanced)
 
-`POST /ocr` accepts one image, returns `{"text": "..."}`. The extracted text is stored on the `ImageItem` as `extractedText`. It can be copied to clipboard or downloaded as `.txt`. It is not used during PDF export — the searchable PDF path runs Tesseract independently inside the backend on the final image bytes.
+`POST /ocr` accepts one image, returns `{"text": "..."}`. Stored on the `ImageItem` as `extractedText`. Can be copied to clipboard or downloaded as `.txt`.
