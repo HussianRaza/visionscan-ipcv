@@ -16,8 +16,8 @@ const jetbrainsMono = JetBrains_Mono({
 import { ThemeProvider } from "@/components/theme-provider";
 
 export const metadata: Metadata = {
-  title: 'IPCV Image-to-PDF',
-  description: 'IPCV Image Processing and PDF Export tool',
+  title: 'VisionScan',
+  description: 'Scan documents and export as PDF',
 };
 
 export default function RootLayout({children}: {children: React.ReactNode}) {

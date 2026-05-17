@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import {
   DndContext,
@@ -19,16 +19,21 @@ import {
 } from '@dnd-kit/sortable';
 import { SortableImage } from '@/components/sortable-image';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { UploadCloud, Wand2, FileText, Download, Settings, Loader2, ImagePlus, Copy, ScanLine } from 'lucide-react';
+import {
+  UploadCloud,
+  Download,
+  Loader2,
+  ScanLine,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  ImagePlus,
+} from 'lucide-react';
 import { toast, Toaster } from 'sonner';
-
 import { ThemeToggle } from '@/components/theme-toggle';
 
 interface ImageItem {
@@ -63,6 +68,22 @@ const DEFAULT_OPTIONS: ProcessingOptions = {
   watermark_text: 'CONFIDENTIAL',
 };
 
+const SCAN_MODES = [
+  { value: 'color' as const, label: 'Color', desc: 'Photos & mixed documents' },
+  { value: 'grayscale' as const, label: 'Grey', desc: 'Printed text & forms' },
+  { value: 'bw' as const, label: 'B&W', desc: 'Maximum contrast' },
+];
+
+const MANUAL_FILTERS = [
+  { id: 'grayscale', label: 'Convert to grey', desc: 'Remove all color' },
+  { id: 'enhance', label: 'Fix lighting', desc: 'Improve contrast and brightness' },
+  { id: 'denoise', label: 'Remove noise', desc: 'Reduce grain and artifacts' },
+  { id: 'sharpen', label: 'Sharpen text', desc: 'Make edges crisper' },
+  { id: 'deskew', label: 'Straighten tilt', desc: 'Correct skewed pages' },
+  { id: 'crop', label: 'Detect borders', desc: 'Auto-crop to document edges' },
+  { id: 'threshold', label: 'High contrast', desc: 'Pure black and white pixels' },
+] as const;
+
 export default function Home() {
   const [images, setImages] = useState<ImageItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -71,19 +92,21 @@ export default function Home() {
   const [isExporting, setIsExporting] = useState(false);
   const [processProgress, setProcessProgress] = useState<{ current: number; total: number } | null>(null);
   const [ocrProgress, setOcrProgress] = useState<{ current: number; total: number } | null>(null);
-  const [searchablePdf, setSearchablePdf] = useState(false);
+  const [searchablePdf, setSearchablePdf] = useState(true);
   const [scanMode, setScanMode] = useState<'color' | 'grayscale' | 'bw'>('color');
   const [isAutoScanning, setIsAutoScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<{ current: number; total: number } | null>(null);
-  const [apiUrl, setApiUrl] = useState(
-    process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-  );
+  const [showingOriginal, setShowingOriginal] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [fileName, setFileName] = useState('document');
+  const [isWakingUp, setIsWakingUp] = useState(false);
+  const coldStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
   const sensors = useSensors(
     useSensor(PointerSensor),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-    })
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
   useEffect(() => {
@@ -108,15 +131,13 @@ export default function Home() {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: {
-      'image/*': ['.jpeg', '.jpg', '.png', '.webp']
-    }
+    accept: { 'image/*': ['.jpeg', '.jpg', '.png', '.webp'] },
   });
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     if (over && active.id !== over.id) {
-      setImages((items) => {
+      setImages(items => {
         const oldIndex = items.findIndex(item => item.id === active.id);
         const newIndex = items.findIndex(item => item.id === over.id);
         return arrayMove(items, oldIndex, newIndex);
@@ -132,14 +153,27 @@ export default function Home() {
         if (img.processedUrl) URL.revokeObjectURL(img.processedUrl);
       }
       const updated = prev.filter(i => i.id !== id);
-      if (activeId === id) {
-        setActiveId(updated.length > 0 ? updated[0].id : null);
-      }
+      if (activeId === id) setActiveId(updated.length > 0 ? updated[0].id : null);
       return updated;
     });
   };
 
-  const activeImage = images.find(img => img.id === activeId);
+  const handleSetActive = (id: string) => {
+    setActiveId(id);
+    setShowingOriginal(false);
+  };
+
+  const startColdStartTimer = () => {
+    coldStartTimerRef.current = setTimeout(() => setIsWakingUp(true), 5000);
+  };
+
+  const cancelColdStartTimer = () => {
+    if (coldStartTimerRef.current) {
+      clearTimeout(coldStartTimerRef.current);
+      coldStartTimerRef.current = null;
+    }
+    setIsWakingUp(false);
+  };
 
   const handleProcess = async () => {
     if (!activeImage) return;
@@ -148,26 +182,15 @@ export default function Home() {
       const formData = new FormData();
       formData.append('file', activeImage.file);
       formData.append('options', JSON.stringify(options));
-
-      const response = await fetch(`${apiUrl}/process`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error('Processing failed');
-
+      const response = await fetch(`${apiUrl}/process`, { method: 'POST', body: formData });
+      if (!response.ok) throw new Error();
       const blob = await response.blob();
       const processedUrl = URL.createObjectURL(blob);
-
-      setImages(prev => prev.map(img =>
-        img.id === activeId
-          ? { ...img, processedUrl }
-          : img
-      ));
-      toast.success('Image processed successfully!');
-    } catch (error) {
-      console.error(error);
-      toast.error('Could not connect to the Python Backend. Make sure it is running or configured correctly in Settings.');
+      setImages(prev => prev.map(img => img.id === activeId ? { ...img, processedUrl } : img));
+      setShowingOriginal(false);
+      toast.success('Adjustments applied!');
+    } catch {
+      toast.error('Processing failed. Check backend connection.');
     } finally {
       setIsProcessing(false);
     }
@@ -177,7 +200,6 @@ export default function Home() {
     if (images.length === 0) return;
     const snapshot = [...images];
     setProcessProgress({ current: 0, total: snapshot.length });
-
     for (let i = 0; i < snapshot.length; i++) {
       setProcessProgress({ current: i + 1, total: snapshot.length });
       const img = snapshot[i];
@@ -185,22 +207,67 @@ export default function Home() {
         const formData = new FormData();
         formData.append('file', img.file);
         formData.append('options', JSON.stringify(options));
-
         const response = await fetch(`${apiUrl}/process`, { method: 'POST', body: formData });
-        if (!response.ok) throw new Error('Processing failed');
-
+        if (!response.ok) throw new Error();
         const blob = await response.blob();
         const processedUrl = URL.createObjectURL(blob);
-        setImages(prev => prev.map(item =>
-          item.id === img.id ? { ...item, processedUrl } : item
-        ));
+        setImages(prev => prev.map(item => item.id === img.id ? { ...item, processedUrl } : item));
       } catch {
         toast.error(`Failed to process page ${i + 1}.`);
       }
     }
-
     setProcessProgress(null);
-    toast.success('All images processed!');
+    toast.success('All pages processed!');
+  };
+
+  const handleAutoScan = async () => {
+    if (!activeImage) return;
+    setIsAutoScanning(true);
+    startColdStartTimer();
+    try {
+      const formData = new FormData();
+      formData.append('file', activeImage.file);
+      formData.append('mode', scanMode);
+      const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
+      cancelColdStartTimer();
+      if (!response.ok) throw new Error();
+      const blob = await response.blob();
+      const processedUrl = URL.createObjectURL(blob);
+      setImages(prev => prev.map(img => img.id === activeId ? { ...img, processedUrl } : img));
+      setShowingOriginal(false);
+      toast.success('Page scanned!');
+    } catch {
+      cancelColdStartTimer();
+      toast.error('Scan failed. Check backend connection.');
+    } finally {
+      setIsAutoScanning(false);
+    }
+  };
+
+  const handleAutoScanAll = async () => {
+    if (images.length === 0) return;
+    const snapshot = [...images];
+    setScanProgress({ current: 0, total: snapshot.length });
+    startColdStartTimer();
+    for (let i = 0; i < snapshot.length; i++) {
+      setScanProgress({ current: i + 1, total: snapshot.length });
+      const img = snapshot[i];
+      try {
+        const formData = new FormData();
+        formData.append('file', img.file);
+        formData.append('mode', scanMode);
+        const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
+        cancelColdStartTimer();
+        if (!response.ok) throw new Error();
+        const blob = await response.blob();
+        const processedUrl = URL.createObjectURL(blob);
+        setImages(prev => prev.map(item => item.id === img.id ? { ...item, processedUrl } : item));
+      } catch {
+        toast.error(`Failed to scan page ${i + 1}.`);
+      }
+    }
+    setScanProgress(null);
+    toast.success('All pages scanned!');
   };
 
   const handleOCR = async () => {
@@ -208,40 +275,23 @@ export default function Home() {
     const fileToProcess = activeImage.processedUrl
       ? await fetch(activeImage.processedUrl).then(r => r.blob())
       : activeImage.file;
-
     try {
-      toast.info('Running OCR...');
       const formData = new FormData();
       formData.append('file', fileToProcess as Blob, activeImage.file.name);
-
-      const response = await fetch(`${apiUrl}/ocr`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error('OCR failed');
-
+      const response = await fetch(`${apiUrl}/ocr`, { method: 'POST', body: formData });
+      if (!response.ok) throw new Error();
       const data = await response.json();
-      setImages(prev => prev.map(img =>
-        img.id === activeId
-          ? { ...img, extractedText: data.text }
-          : img
-      ));
-      toast.success('Text extracted successfully!');
-    } catch (error) {
-      console.error(error);
+      setImages(prev => prev.map(img => img.id === activeId ? { ...img, extractedText: data.text } : img));
+      toast.success('Text extracted!');
+    } catch {
       toast.error('OCR failed. Check backend connection.');
     }
   };
 
   const handleOCRAll = async () => {
     const toProcess = images.filter(img => !img.extractedText);
-    if (toProcess.length === 0) {
-      toast.info('All images already have extracted text.');
-      return;
-    }
+    if (toProcess.length === 0) { toast.info('All pages already have text.'); return; }
     setOcrProgress({ current: 0, total: toProcess.length });
-
     for (let i = 0; i < toProcess.length; i++) {
       setOcrProgress({ current: i + 1, total: toProcess.length });
       const img = toProcess[i];
@@ -252,73 +302,15 @@ export default function Home() {
         const formData = new FormData();
         formData.append('file', fileToProcess as Blob, img.file.name);
         const response = await fetch(`${apiUrl}/ocr`, { method: 'POST', body: formData });
-        if (!response.ok) throw new Error('OCR failed');
+        if (!response.ok) throw new Error();
         const data = await response.json();
-        setImages(prev => prev.map(item =>
-          item.id === img.id ? { ...item, extractedText: data.text } : item
-        ));
+        setImages(prev => prev.map(item => item.id === img.id ? { ...item, extractedText: data.text } : item));
       } catch {
-        // continue with remaining images
+        // continue
       }
     }
-
     setOcrProgress(null);
-    toast.success('OCR complete on all images!');
-  };
-
-  const handleAutoScan = async () => {
-    if (!activeImage) return;
-    setIsAutoScanning(true);
-    try {
-      const formData = new FormData();
-      formData.append('file', activeImage.file);
-      formData.append('mode', scanMode);
-
-      const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
-      if (!response.ok) throw new Error('Auto scan failed');
-
-      const blob = await response.blob();
-      const processedUrl = URL.createObjectURL(blob);
-      setImages(prev => prev.map(img =>
-        img.id === activeId ? { ...img, processedUrl } : img
-      ));
-      toast.success('Image scanned successfully!');
-    } catch (error) {
-      console.error(error);
-      toast.error('Auto scan failed. Check backend connection.');
-    } finally {
-      setIsAutoScanning(false);
-    }
-  };
-
-  const handleAutoScanAll = async () => {
-    if (images.length === 0) return;
-    const snapshot = [...images];
-    setScanProgress({ current: 0, total: snapshot.length });
-
-    for (let i = 0; i < snapshot.length; i++) {
-      setScanProgress({ current: i + 1, total: snapshot.length });
-      const img = snapshot[i];
-      try {
-        const formData = new FormData();
-        formData.append('file', img.file);
-        formData.append('mode', scanMode);
-
-        const response = await fetch(`${apiUrl}/auto-scan`, { method: 'POST', body: formData });
-        if (!response.ok) throw new Error('Auto scan failed');
-
-        const blob = await response.blob();
-        const processedUrl = URL.createObjectURL(blob);
-        setImages(prev => prev.map(item =>
-          item.id === img.id ? { ...item, processedUrl } : item
-        ));
-      } catch {
-        toast.error(`Failed to scan page ${i + 1}.`);
-      }
-    }
-
-    setScanProgress(null);
-    toast.success('All pages scanned!');
+    toast.success('Text extracted from all pages!');
   };
 
   const handleCopyAllText = () => {
@@ -326,12 +318,9 @@ export default function Home() {
       .filter(img => img.extractedText)
       .map((img, i) => `--- Page ${i + 1} ---\n${img.extractedText}`)
       .join('\n\n');
-    if (!allText) {
-      toast.error('No extracted text to copy.');
-      return;
-    }
+    if (!allText) { toast.error('No extracted text to copy.'); return; }
     navigator.clipboard.writeText(allText);
-    toast.success('All text copied to clipboard!');
+    toast.success('Copied to clipboard!');
   };
 
   const handleDownloadText = () => {
@@ -339,20 +328,16 @@ export default function Home() {
       .filter(img => img.extractedText)
       .map((img, i) => `--- Page ${i + 1} ---\n${img.extractedText}`)
       .join('\n\n');
-    if (!allText) {
-      toast.error('No extracted text to download.');
-      return;
-    }
+    if (!allText) { toast.error('No extracted text to download.'); return; }
     const blob = new Blob([allText], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `document_text_${Date.now()}.txt`;
+    a.download = `${fileName.trim() || 'document'}_text.txt`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    toast.success('Text file downloaded!');
   };
 
   const handleExportPDF = async () => {
@@ -367,388 +352,460 @@ export default function Home() {
         formData.append('files', fileToUse, img.file.name);
       }
       formData.append('searchable', searchablePdf ? 'true' : 'false');
-
-      const response = await fetch(`${apiUrl}/export-pdf`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error('PDF Export failed');
-
+      const response = await fetch(`${apiUrl}/export-pdf`, { method: 'POST', body: formData });
+      if (!response.ok) throw new Error();
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `document_${Date.now()}.pdf`;
+      a.download = `${fileName.trim() || 'document'}.pdf`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      toast.success('PDF downloaded successfully!');
-    } catch (error) {
-      console.error(error);
+      toast.success('PDF downloaded!');
+    } catch {
       toast.error('Failed to export PDF. Check backend connection.');
     } finally {
       setIsExporting(false);
     }
   };
 
-  const hasAnyText = images.some(img => img.extractedText);
+  const activeImage = images.find(img => img.id === activeId);
+  const isBatchAutoScan = scanProgress !== null;
   const isBatchProcessing = processProgress !== null;
   const isBatchOCR = ocrProgress !== null;
-  const isBatchAutoScan = scanProgress !== null;
+  const anyActive = isAutoScanning || isProcessing || isBatchAutoScan || isBatchProcessing;
+  const hasAnyText = images.some(img => img.extractedText);
 
-  return (
-    <div className="min-h-screen bg-background text-foreground font-sans">
-      <header className="bg-background border-b border-border px-6 py-4 flex items-center justify-between sticky top-0 z-10">
-        <div className="flex items-center gap-2 text-primary font-semibold text-lg tracking-tight">
-          <div className="bg-primary/10 p-2 rounded-lg">
-            <FileText className="w-5 h-5 text-primary" />
-          </div>
-          IPCV DocuScan
+  // ─── Render ──────────────────────────────────────────────────────────────────
+
+  const controlsPanel = (
+    <div className="p-5 space-y-6">
+      {/* Auto Scan */}
+      <section className="space-y-4">
+        <div>
+          <h2 className="font-semibold flex items-center gap-2">
+            <ScanLine className="w-4 h-4" />
+            Auto Scan
+          </h2>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Detect edges, fix perspective, and enhance in one step
+          </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <ThemeToggle />
-          <Dialog>
-            <DialogTrigger className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground h-10 w-10 text-muted-foreground">
-                <Settings className="w-5 h-5" />
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Backend Configuration</DialogTitle>
-              </DialogHeader>
-              <div className="py-4 space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="apiUrl">FastAPI Backend URL</Label>
-                  <Input
-                    id="apiUrl"
-                    value={apiUrl}
-                    onChange={e => setApiUrl(e.target.value)}
-                    placeholder="https://your-space.hf.space"
+        <div className="space-y-1.5">
+          {SCAN_MODES.map(mode => (
+            <button
+              key={mode.value}
+              onClick={() => setScanMode(mode.value)}
+              className={`w-full flex items-center gap-3 p-3 rounded-lg border text-left transition-all ${
+                scanMode === mode.value
+                  ? 'border-foreground bg-foreground/5 shadow-sm'
+                  : 'border-border hover:border-foreground/30 hover:bg-muted/30'
+              }`}
+            >
+              <div className={`w-3.5 h-3.5 rounded-full border-2 shrink-0 flex items-center justify-center ${
+                scanMode === mode.value ? 'border-foreground' : 'border-muted-foreground'
+              }`}>
+                {scanMode === mode.value && (
+                  <div className="w-1.5 h-1.5 rounded-full bg-foreground" />
+                )}
+              </div>
+              <div>
+                <div className="text-sm font-medium">{mode.label}</div>
+                <div className="text-xs text-muted-foreground">{mode.desc}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+
+        <div className="space-y-2">
+          <Button
+            className="w-full"
+            size="lg"
+            onClick={handleAutoScanAll}
+            disabled={images.length === 0 || isAutoScanning || isBatchAutoScan}
+          >
+            {isBatchAutoScan ? (
+              <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Scanning {scanProgress!.current} of {scanProgress!.total}</>
+            ) : (
+              <><ScanLine className="w-4 h-4 mr-2" />Scan All Pages {images.length > 0 && `(${images.length})`}</>
+            )}
+          </Button>
+          <button
+            className="w-full py-1.5 text-xs text-center text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={handleAutoScan}
+            disabled={!activeImage || isAutoScanning || isBatchAutoScan}
+          >
+            {isAutoScanning ? (
+              <span className="flex items-center justify-center gap-1.5">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Scanning this page…
+              </span>
+            ) : 'or scan this page only'}
+          </button>
+        </div>
+
+        {isWakingUp && (
+          <p className="text-[11px] text-muted-foreground text-center leading-relaxed">
+            Waking up the server — about 30 seconds on first use
+          </p>
+        )}
+      </section>
+
+      <div className="border-t border-border" />
+
+      {/* Advanced */}
+      <section>
+        <button
+          onClick={() => setShowAdvanced(v => !v)}
+          className="w-full flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors py-0.5"
+        >
+          {showAdvanced
+            ? <ChevronDown className="w-4 h-4" />
+            : <ChevronRight className="w-4 h-4" />
+          }
+          Advanced adjustments
+        </button>
+
+        {showAdvanced && (
+          <div className="mt-4 space-y-5">
+            <div className="space-y-3">
+              {MANUAL_FILTERS.map(filter => (
+                <div key={filter.id} className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm">{filter.label}</div>
+                    <div className="text-[11px] text-muted-foreground">{filter.desc}</div>
+                  </div>
+                  <Switch
+                    checked={options[filter.id as keyof ProcessingOptions] as boolean}
+                    onCheckedChange={c => setOptions(prev => ({ ...prev, [filter.id]: c }))}
                   />
-                  <p className="text-xs text-muted-foreground">
-                    Must point to your running Python backend (Local or Hugging Face Spaces).
-                  </p>
                 </div>
-              </div>
-            </DialogContent>
-          </Dialog>
-        </div>
-      </header>
+              ))}
 
-      <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Left Sidebar - Tools */}
-        <div className="lg:col-span-3 space-y-6">
-          <Card className="shadow-sm border-primary/30 bg-primary/5">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base font-medium flex items-center gap-2">
-                <ScanLine className="w-4 h-4 text-primary" />
-                Auto Scan
-              </CardTitle>
-              <CardDescription>Detect, crop & enhance in one click</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex rounded-lg border border-border overflow-hidden text-xs font-medium">
-                {(['color', 'grayscale', 'bw'] as const).map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => setScanMode(m)}
-                    className={`flex-1 py-2 transition-colors ${
-                      scanMode === m
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-background text-muted-foreground hover:bg-muted'
-                    }`}
-                  >
-                    {m === 'color' ? 'Color' : m === 'grayscale' ? 'Grey' : 'B&W'}
-                  </button>
-                ))}
-              </div>
-              <Button
-                className="w-full"
-                onClick={handleAutoScan}
-                disabled={!activeImage || isAutoScanning || isBatchAutoScan}
-              >
-                {isAutoScanning
-                  ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  : <ScanLine className="w-4 h-4 mr-2" />}
-                Scan Selected
-              </Button>
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={handleAutoScanAll}
-                disabled={images.length === 0 || isAutoScanning || isBatchAutoScan}
-              >
-                {isBatchAutoScan ? (
-                  <>
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    Scanning {scanProgress?.current} / {scanProgress?.total}
-                  </>
-                ) : (
-                  'Scan All Pages'
+              <div>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm">Add watermark</div>
+                    <div className="text-[11px] text-muted-foreground">Stamp text on each page</div>
+                  </div>
+                  <Switch
+                    checked={options.watermark}
+                    onCheckedChange={c => setOptions(prev => ({ ...prev, watermark: c }))}
+                  />
+                </div>
+                {options.watermark && (
+                  <Input
+                    value={options.watermark_text}
+                    onChange={e => setOptions(prev => ({ ...prev, watermark_text: e.target.value }))}
+                    className="mt-2 h-8 text-sm"
+                    placeholder="Watermark text"
+                  />
                 )}
-              </Button>
-            </CardContent>
-          </Card>
-
-          <Card className="shadow-sm border-border">
-            <CardHeader className="pb-4">
-              <CardTitle className="text-base font-medium flex items-center gap-2">
-                <Wand2 className="w-4 h-4" />
-                IPCV Processing
-              </CardTitle>
-              <CardDescription>Apply OpenCV filters to selected image</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-4">
-                {[
-                  { id: 'grayscale', label: 'Grayscale', desc: 'Convert to black and white' },
-                  { id: 'enhance', label: 'Auto Contrast', desc: 'Histogram equalization' },
-                  { id: 'denoise', label: 'Denoise', desc: 'Remove grain/noise' },
-                  { id: 'sharpen', label: 'Sharpen Edges', desc: 'Make text crisper' },
-                  { id: 'deskew', label: 'Auto Deskew', desc: 'Straighten tilted text' },
-                  { id: 'crop', label: 'Document Crop', desc: 'Auto detect borders' },
-                  { id: 'threshold', label: 'Binarize', desc: 'High contrast document' },
-                ].map((opt) => (
-                  <div key={opt.id} className="flex items-center justify-between">
-                    <div>
-                      <Label htmlFor={opt.id} className="cursor-pointer">{opt.label}</Label>
-                      <p className="text-[10px] text-muted-foreground">{opt.desc}</p>
-                    </div>
-                    <Switch
-                      id={opt.id}
-                      checked={options[opt.id as keyof ProcessingOptions] as boolean}
-                      onCheckedChange={(c) => setOptions(prev => ({...prev, [opt.id]: c}))}
-                    />
-                  </div>
-                ))}
-
-                <div className="pt-4 border-t border-border">
-                  <div className="flex items-center justify-between mb-2">
-                    <Label htmlFor="watermark" className="cursor-pointer">Watermark</Label>
-                    <Switch
-                      id="watermark"
-                      checked={options.watermark}
-                      onCheckedChange={(c) => setOptions(prev => ({...prev, watermark: c}))}
-                    />
-                  </div>
-                  {options.watermark && (
-                    <Input
-                      value={options.watermark_text}
-                      onChange={(e) => setOptions(prev => ({...prev, watermark_text: e.target.value}))}
-                      className="h-8 text-sm mt-2"
-                      placeholder="Enter watermark text"
-                    />
-                  )}
-                </div>
               </div>
+            </div>
 
-              <div className="space-y-2 pt-2">
+            <div className="flex gap-2">
+              <Button
+                variant="outline" size="sm" className="flex-1 text-xs"
+                onClick={handleProcess}
+                disabled={!activeImage || isProcessing || isBatchProcessing}
+              >
+                {isProcessing ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : null}
+                This page
+              </Button>
+              <Button
+                variant="outline" size="sm" className="flex-1 text-xs"
+                onClick={handleProcessAll}
+                disabled={images.length === 0 || isProcessing || isBatchProcessing}
+              >
+                {isBatchProcessing
+                  ? <><Loader2 className="w-3 h-3 mr-1 animate-spin" />{processProgress!.current}/{processProgress!.total}</>
+                  : 'All pages'
+                }
+              </Button>
+            </div>
+
+            <div className="pt-3 border-t border-border space-y-3">
+              <p className="text-xs font-medium text-muted-foreground">Extract text (OCR)</p>
+              <div className="flex gap-2">
                 <Button
-                  className="w-full"
-                  onClick={handleProcess}
-                  disabled={!activeImage || isProcessing || isBatchProcessing}
+                  variant="outline" size="sm" className="flex-1 text-xs"
+                  onClick={handleOCR}
+                  disabled={!activeImage || isBatchOCR}
                 >
-                  {isProcessing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
-                  Apply to Selected
+                  This page
                 </Button>
                 <Button
-                  variant="outline"
-                  className="w-full"
-                  onClick={handleProcessAll}
-                  disabled={images.length === 0 || isProcessing || isBatchProcessing}
+                  variant="outline" size="sm" className="flex-1 text-xs"
+                  onClick={handleOCRAll}
+                  disabled={images.length === 0 || isBatchOCR}
                 >
-                  {isBatchProcessing ? (
-                    <>
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                      Processing {processProgress?.current} / {processProgress?.total}
-                    </>
-                  ) : (
-                    'Process All Pages'
-                  )}
+                  {isBatchOCR
+                    ? <><Loader2 className="w-3 h-3 mr-1 animate-spin" />{ocrProgress!.current}/{ocrProgress!.total}</>
+                    : 'All pages'
+                  }
                 </Button>
               </div>
-            </CardContent>
-          </Card>
-
-          <Card className="shadow-sm border-border">
-            <CardHeader className="pb-4">
-              <CardTitle className="text-base font-medium flex items-center gap-2">
-                <FileText className="w-4 h-4" />
-                Text Extraction
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={handleOCR}
-                disabled={!activeImage || isBatchOCR}
-              >
-                Run OCR on Selected
-              </Button>
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={handleOCRAll}
-                disabled={images.length === 0 || isBatchOCR}
-              >
-                {isBatchOCR ? (
-                  <>
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    OCR {ocrProgress?.current} / {ocrProgress?.total}
-                  </>
-                ) : (
-                  'Run OCR on All Pages'
-                )}
-              </Button>
               {hasAnyText && (
-                <div className="flex gap-2 pt-2 border-t border-border">
-                  <Button variant="ghost" size="sm" className="flex-1" onClick={handleCopyAllText}>
-                    <Copy className="w-3 h-3 mr-1" />
-                    Copy All
+                <div className="flex gap-2">
+                  <Button variant="ghost" size="sm" className="flex-1 text-xs" onClick={handleCopyAllText}>
+                    <Copy className="w-3 h-3 mr-1" />Copy text
                   </Button>
-                  <Button variant="ghost" size="sm" className="flex-1" onClick={handleDownloadText}>
-                    <Download className="w-3 h-3 mr-1" />
-                    Save .txt
+                  <Button variant="ghost" size="sm" className="flex-1 text-xs" onClick={handleDownloadText}>
+                    <Download className="w-3 h-3 mr-1" />Save .txt
                   </Button>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* Center - Preview area */}
-        <div className="lg:col-span-6 space-y-6">
-          <Tabs defaultValue="preview" className="w-full">
-            <div className="flex items-center justify-between mb-4">
-              <TabsList>
-                <TabsTrigger value="preview">Live Preview</TabsTrigger>
-                <TabsTrigger value="ocr">Extracted Text</TabsTrigger>
-              </TabsList>
-              {activeImage?.processedUrl && (
-                <div className="text-xs bg-primary/10 text-primary px-2 py-1 rounded font-medium">
-                  Processed
                 </div>
               )}
             </div>
+          </div>
+        )}
+      </section>
 
-            <TabsContent value="preview" className="m-0">
-              <Card className="border-border shadow-sm overflow-hidden bg-muted/30 relative">
-                {activeImage ? (
-                  <div className="relative aspect-[3/4] w-full flex items-center justify-center p-4">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={activeImage.processedUrl || activeImage.originalUrl}
-                      alt="Preview"
-                      className="max-w-full max-h-[70vh] object-contain drop-shadow-sm transition-opacity"
-                      style={{ opacity: isProcessing ? 0.5 : 1 }}
-                    />
-                    {isProcessing && (
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <Loader2 className="w-8 h-8 animate-spin text-primary" />
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="aspect-[3/4] flex flex-col items-center justify-center text-muted-foreground p-8 text-center border-2 border-dashed border-border m-4 rounded-xl">
-                    <ImagePlus className="w-12 h-12 mb-4 text-muted-foreground" />
-                    <p className="font-medium text-muted-foreground mb-1">No image selected</p>
-                    <p className="text-sm">Upload images to begin processing</p>
-                  </div>
-                )}
-              </Card>
-            </TabsContent>
-            <TabsContent value="ocr" className="m-0">
-              <Card className="min-h-[400px] border-border shadow-sm p-6 bg-card prose prose-sm max-w-none dark:prose-invert">
-                {activeImage?.extractedText ? (
-                  <pre className="whitespace-pre-wrap font-sans text-foreground">
-                    {activeImage.extractedText}
-                  </pre>
-                ) : (
-                  <div className="h-[400px] flex items-center justify-center text-muted-foreground text-sm">
-                    No text extracted yet. Run OCR from the sidebar.
-                  </div>
-                )}
-              </Card>
-            </TabsContent>
-          </Tabs>
+      <div className="border-t border-border" />
+
+      {/* Export */}
+      <section className="space-y-4">
+        <h2 className="font-semibold flex items-center gap-2">
+          <Download className="w-4 h-4" />
+          Export
+        </h2>
+
+        <div className="flex">
+          <Input
+            value={fileName}
+            onChange={e => setFileName(e.target.value)}
+            className="rounded-r-none text-sm h-9"
+            placeholder="document"
+          />
+          <span className="flex items-center px-3 border border-l-0 border-input bg-muted rounded-r-md text-xs text-muted-foreground shrink-0">
+            .pdf
+          </span>
         </div>
 
-        {/* Right Sidebar - Pages & Export */}
-        <div className="lg:col-span-3 flex flex-col h-[calc(100vh-8rem)]">
-          <Card className="shadow-sm border-border flex-1 flex flex-col hidden lg:flex">
-            <CardHeader className="pb-4 shrink-0">
-              <CardTitle className="text-base font-medium">Pages ({images.length})</CardTitle>
-              <CardDescription>Drag to reorder</CardDescription>
-            </CardHeader>
-            <CardContent className="flex-1 overflow-hidden p-0 px-6 pb-6 flex flex-col gap-4">
+        <div className="flex items-center justify-between py-3 px-3 bg-muted/40 rounded-lg">
+          <div>
+            <Label htmlFor="searchable-pdf" className="text-sm cursor-pointer">Searchable PDF</Label>
+            <p className="text-[11px] text-muted-foreground">Embed selectable text via OCR</p>
+          </div>
+          <Switch
+            id="searchable-pdf"
+            checked={searchablePdf}
+            onCheckedChange={setSearchablePdf}
+          />
+        </div>
+
+        <Button
+          className="w-full"
+          size="lg"
+          onClick={handleExportPDF}
+          disabled={images.length === 0 || isExporting}
+        >
+          {isExporting
+            ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Creating PDF…</>
+            : <><Download className="w-4 h-4 mr-2" />Export as PDF</>
+          }
+        </Button>
+      </section>
+    </div>
+  );
+
+  return (
+    <div className="h-screen flex flex-col bg-background text-foreground font-sans overflow-hidden">
+      {/* Header */}
+      <header className="shrink-0 h-14 border-b border-border px-5 flex items-center justify-between">
+        <div className="flex items-center gap-2 font-semibold tracking-tight">
+          <ScanLine className="w-5 h-5" />
+          VisionScan
+        </div>
+        <ThemeToggle />
+      </header>
+
+      {/* Progress banner */}
+      {anyActive && (
+        <div className="shrink-0 bg-primary text-primary-foreground px-6 py-2.5 flex items-center justify-center gap-3 text-sm">
+          <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+          <span>
+            {isBatchAutoScan
+              ? `Scanning page ${scanProgress!.current} of ${scanProgress!.total}…`
+              : isBatchProcessing
+                ? `Processing page ${processProgress!.current} of ${processProgress!.total}…`
+                : isAutoScanning
+                  ? 'Scanning…'
+                  : 'Processing…'
+            }
+            {isWakingUp && ' — Server is starting up, about 30 seconds'}
+          </span>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {images.length === 0 ? (
+        <div className="flex-1 flex items-center justify-center p-8">
+          <div
+            {...getRootProps()}
+            className={`max-w-md w-full rounded-2xl border-2 border-dashed p-16 text-center cursor-pointer transition-all select-none ${
+              isDragActive
+                ? 'border-primary bg-primary/5 scale-[1.01]'
+                : 'border-border hover:border-foreground/40 hover:bg-muted/20'
+            }`}
+          >
+            <input {...getInputProps()} />
+            <div className="w-16 h-16 rounded-2xl bg-muted flex items-center justify-center mx-auto mb-6">
+              <UploadCloud className="w-8 h-8 text-muted-foreground" />
+            </div>
+            <h2 className="text-xl font-semibold mb-2">
+              {isDragActive ? 'Drop to add pages' : 'Add your documents'}
+            </h2>
+            <p className="text-muted-foreground text-sm mb-6">
+              Drag and drop photos here, or click to browse
+            </p>
+            <p className="text-xs text-muted-foreground">JPEG · PNG · WebP</p>
+          </div>
+        </div>
+      ) : (
+        /* Main app layout */
+        <div className="flex flex-1 overflow-hidden">
+          {/* Left: pages sidebar */}
+          <aside className="hidden lg:flex flex-col w-52 shrink-0 border-r border-border bg-background overflow-hidden">
+            <div className="p-3 border-b border-border shrink-0">
               <div
                 {...getRootProps()}
-                className={`shrink-0 border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
-                  isDragActive ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50 hover:bg-muted'
+                className={`border border-dashed rounded-lg p-3 text-center cursor-pointer transition-colors ${
+                  isDragActive
+                    ? 'border-primary bg-primary/5 text-primary'
+                    : 'border-border text-muted-foreground hover:border-foreground/40 hover:text-foreground'
                 }`}
               >
                 <input {...getInputProps()} />
-                <UploadCloud className="w-6 h-6 mx-auto mb-2 text-muted-foreground" />
-                <p className="text-xs font-medium text-muted-foreground">Drop images here</p>
-              </div>
-
-              <ScrollArea className="flex-1 -mx-2 px-2">
-                <DndContext
-                  sensors={sensors}
-                  collisionDetection={closestCenter}
-                  onDragEnd={handleDragEnd}
-                >
-                  <SortableContext
-                    items={images.map(i => i.id)}
-                    strategy={rectSortingStrategy}
-                  >
-                    <div className="grid grid-cols-2 gap-3 pb-4">
-                      {images.map((img) => (
-                        <SortableImage
-                          key={img.id}
-                          id={img.id}
-                          url={img.processedUrl || img.originalUrl}
-                          onRemove={removeImage}
-                          onClick={setActiveId}
-                          isActive={activeId === img.id}
-                        />
-                      ))}
-                    </div>
-                  </SortableContext>
-                </DndContext>
-              </ScrollArea>
-            </CardContent>
-
-            <div className="shrink-0 border-t border-border rounded-b-lg overflow-hidden">
-              <div className="px-4 py-3 bg-muted/30 flex items-center justify-between">
-                <div>
-                  <Label htmlFor="searchable-pdf" className="text-xs cursor-pointer">Searchable PDF</Label>
-                  <p className="text-[10px] text-muted-foreground">Embed selectable text layer</p>
-                </div>
-                <Switch
-                  id="searchable-pdf"
-                  checked={searchablePdf}
-                  onCheckedChange={setSearchablePdf}
-                />
-              </div>
-              <div className="p-4 bg-muted/50">
-                <Button
-                  className="w-full"
-                  size="lg"
-                  onClick={handleExportPDF}
-                  disabled={images.length === 0 || isExporting}
-                >
-                  {isExporting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Download className="w-4 h-4 mr-2" />}
-                  Export PDF
-                </Button>
+                <UploadCloud className="w-4 h-4 mx-auto mb-1" />
+                <p className="text-xs font-medium">Add pages</p>
               </div>
             </div>
-          </Card>
+
+            <ScrollArea className="flex-1 min-h-0">
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                onDragEnd={handleDragEnd}
+              >
+                <SortableContext
+                  items={images.map(i => i.id)}
+                  strategy={rectSortingStrategy}
+                >
+                  <div className="p-3 space-y-2">
+                    {images.map((img, index) => (
+                      <SortableImage
+                        key={img.id}
+                        id={img.id}
+                        url={img.processedUrl || img.originalUrl}
+                        onRemove={removeImage}
+                        onClick={handleSetActive}
+                        isActive={activeId === img.id}
+                        pageNumber={index + 1}
+                        isProcessed={!!img.processedUrl}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+              </DndContext>
+            </ScrollArea>
+          </aside>
+
+          {/* Center + right: stacked on mobile, side-by-side on lg */}
+          <div className="flex-1 flex flex-col lg:flex-row overflow-hidden min-w-0">
+            {/* Mobile: horizontal thumbnail strip */}
+            <div className="lg:hidden shrink-0 border-b border-border overflow-x-auto">
+              <div className="flex gap-2 p-3">
+                <div
+                  {...getRootProps()}
+                  className="shrink-0 w-14 h-20 rounded border-2 border-dashed border-border flex flex-col items-center justify-center cursor-pointer text-muted-foreground hover:border-foreground/40 transition-colors"
+                >
+                  <input {...getInputProps()} />
+                  <UploadCloud className="w-4 h-4" />
+                </div>
+                {images.map((img, index) => (
+                  <button
+                    key={img.id}
+                    onClick={() => handleSetActive(img.id)}
+                    className={`shrink-0 relative w-14 h-20 rounded overflow-hidden transition-all ${
+                      activeId === img.id ? 'ring-2 ring-primary ring-offset-1' : 'opacity-70 hover:opacity-100'
+                    }`}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={img.processedUrl || img.originalUrl} alt={`Page ${index + 1}`} className="w-full h-full object-cover" />
+                    <span className="absolute bottom-0.5 left-0.5 bg-black/60 text-white text-[9px] px-1 rounded">
+                      {index + 1}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Preview area */}
+            <div className="flex-1 relative overflow-hidden bg-muted/20 min-h-0">
+              {activeImage ? (
+                <>
+                  <div className="absolute inset-0 flex items-center justify-center p-6 lg:p-10">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={
+                        showingOriginal
+                          ? activeImage.originalUrl
+                          : (activeImage.processedUrl || activeImage.originalUrl)
+                      }
+                      alt="Document preview"
+                      className="max-w-full max-h-full object-contain drop-shadow-xl rounded-sm transition-opacity"
+                      style={{ opacity: (isAutoScanning || isProcessing) ? 0.4 : 1 }}
+                    />
+                  </div>
+
+                  {/* Before/After toggle */}
+                  {activeImage.processedUrl && (
+                    <div className="absolute bottom-5 left-1/2 -translate-x-1/2">
+                      <div className="flex rounded-full border border-border bg-background/95 backdrop-blur-sm shadow-lg overflow-hidden text-sm font-medium">
+                        <button
+                          onClick={() => setShowingOriginal(true)}
+                          className={`px-5 py-2 transition-colors ${
+                            showingOriginal
+                              ? 'bg-foreground text-background'
+                              : 'text-muted-foreground hover:text-foreground'
+                          }`}
+                        >
+                          Before
+                        </button>
+                        <button
+                          onClick={() => setShowingOriginal(false)}
+                          className={`px-5 py-2 transition-colors ${
+                            !showingOriginal
+                              ? 'bg-foreground text-background'
+                              : 'text-muted-foreground hover:text-foreground'
+                          }`}
+                        >
+                          After
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-muted-foreground">
+                  <ImagePlus className="w-10 h-10 mb-3" />
+                  <p className="text-sm">Select a page to preview</p>
+                </div>
+              )}
+            </div>
+
+            {/* Controls panel */}
+            <aside className="lg:w-80 lg:shrink-0 lg:border-l border-t lg:border-t-0 border-border overflow-y-auto">
+              {controlsPanel}
+            </aside>
+          </div>
         </div>
-      </main>
+      )}
+
       <Toaster position="top-center" richColors />
     </div>
   );
