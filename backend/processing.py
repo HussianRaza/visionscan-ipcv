@@ -191,12 +191,40 @@ def _find_best_quad(edges, img_area, upscale=1.0):
         return (best_quad.reshape(4, 2) * upscale).astype("float32")
     return None
 
+def _grabcut_quad(img, img_area, upscale=1.0):
+    """
+    Primary crop strategy from LearnOpenCV's automatic document scanner.
+    Morphological closing wipes out text/detail so the document becomes a
+    solid blob; GrabCut then isolates it from the background before Canny.
+    Source: https://learnopencv.com/automatic-document-scanner-using-opencv/
+    """
+    h, w = img.shape[:2]
+    kernel = np.ones((5, 5), np.uint8)
+    closed = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    mask = np.zeros((h, w), np.uint8)
+    bgd  = np.zeros((1, 65), np.float64)
+    fgd  = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(closed, mask, (20, 20, w - 40, h - 40), bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    except Exception:
+        return None
+
+    fg = closed * np.where((mask == 2) | (mask == 0), 0, 1).astype("uint8")[:, :, np.newaxis]
+
+    gray = cv2.cvtColor(fg, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (11, 11), 0)
+    canny = cv2.Canny(gray, 0, 200)
+    canny = cv2.dilate(canny, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    return _find_best_quad(canny, img_area, upscale)
+
 def apply_document_crop(img):
     orig = img.copy()
     h, w = img.shape[:2]
 
-    # Downscale longest edge to 1024 px for fast processing
-    scale = min(1.0, 1024.0 / max(h, w))
+    # Downscale longest edge to 1080 px for fast processing
+    scale = min(1.0, 1080.0 / max(h, w))
     small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1.0 else img.copy()
     sh, sw = small.shape[:2]
     small_area = sh * sw
@@ -204,14 +232,18 @@ def apply_document_crop(img):
 
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    # Strategy 1: bilateral filter (edge-preserving) + adaptive Canny
-    bilateral = cv2.bilateralFilter(small, 9, 75, 75)
-    gray1 = cv2.cvtColor(bilateral, cv2.COLOR_BGR2GRAY)
-    edges1 = _auto_canny(gray1)
-    edges1 = cv2.dilate(edges1, np.ones((3, 3), np.uint8), iterations=1)
-    quad = _find_best_quad(edges1, small_area, upscale)
+    # Strategy 1 (primary): GrabCut — robust against complex backgrounds
+    quad = _grabcut_quad(small, small_area, upscale)
 
-    # Strategy 2: Gaussian + wider Canny + morphological closing
+    # Strategy 2: bilateral filter (edge-preserving) + adaptive Canny
+    if quad is None:
+        bilateral = cv2.bilateralFilter(small, 9, 75, 75)
+        gray1 = cv2.cvtColor(bilateral, cv2.COLOR_BGR2GRAY)
+        edges1 = _auto_canny(gray1)
+        edges1 = cv2.dilate(edges1, np.ones((3, 3), np.uint8), iterations=1)
+        quad = _find_best_quad(edges1, small_area, upscale)
+
+    # Strategy 3: Gaussian + wider Canny + morphological closing
     if quad is None:
         gray2 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         blur2 = cv2.GaussianBlur(gray2, (5, 5), 0)
@@ -219,7 +251,7 @@ def apply_document_crop(img):
         edges2 = cv2.morphologyEx(edges2, cv2.MORPH_CLOSE, close_kernel)
         quad = _find_best_quad(edges2, small_area, upscale)
 
-    # Strategy 3: adaptive threshold → Canny + aggressive closing
+    # Strategy 4: adaptive threshold → Canny + aggressive closing
     if quad is None:
         gray3 = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         thresh = cv2.adaptiveThreshold(gray3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
